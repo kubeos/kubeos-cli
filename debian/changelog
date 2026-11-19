@@ -1,3 +1,18 @@
+kubeos-cli (1.0.0-6) trixie; urgency=medium
+
+  * kubeos-node-join: read the API endpoint and the pod subnet with retries, and fall back
+    to this node's own podCIDR, instead of giving up on the first empty answer. On kubeos2
+    (2026-11-19) both reads came back empty while the API was still settling, the join logged
+    one warning, and kube-proxy stayed unconfigured - which is not "no proxy": the unit kept
+    the Service rules of the cluster the machine ran BEFORE the join, and those DNAT cluster
+    DNS (10.96.0.10) to the worker itself, so every pod on the worker got "connection refused"
+    from DNS while the control plane was fine.
+  * The join now stops kube-proxy and flushes its stale KUBE-* chains before restarting it,
+    and when it truly cannot configure the proxy it stops the unit instead of leaving the old
+    rules in place.
+
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 22:55:00 +0530
+
 kubeos-cli (1.0.0-1kubeos4) trixie; urgency=medium
 
   * kubeos-dashboard-install: decide "already installed" by the payload CHECKSUM, not by

@@ -394,14 +394,51 @@ install_kube_proxy() {
         return 0
     }
     kc="kubectl --kubeconfig=$DASHBOARD_KUBECONFIG"
-    endpoint=$($kc config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)
-    cidr=$($kc -n kube-system get configmap kubeadm-config \
-        -o jsonpath='{.data.ClusterConfiguration}' 2>/dev/null |
-        awk '/podSubnet:/ {print $2; exit}' || true)
+    # Both values are read from the cluster, and BOTH reads can come back empty for a few
+    # seconds after a join: the API is still settling and the dashboard identity may not be
+    # able to read a kube-system ConfigMap yet. Giving up on the first empty answer is how
+    # kubeos2 ended up with an unconfigured kube-proxy (2026-11-19) - and an unconfigured
+    # kube-proxy is not "no proxy", it is the proxy of the cluster this machine ran BEFORE the
+    # join, whose Service rules point at this node itself. So: retry, then fall back.
+    endpoint=""
+    cidr=""
+    i=1
+    while [ "$i" -le 30 ]; do
+        if [ -z "$endpoint" ]; then
+            endpoint=$($kc config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)
+        fi
+        if [ -z "$cidr" ]; then
+            cidr=$($kc -n kube-system get configmap kubeadm-config \
+                -o jsonpath='{.data.ClusterConfiguration}' 2>/dev/null |
+                awk '/podSubnet:/ {print $2; exit}' || true)
+        fi
+        if [ -z "$cidr" ]; then
+            # Fallback: KubeOS always uses a /16 pod network and hands each node a /24 out of
+            # it, so this node's own podCIDR identifies the cluster network even when the
+            # kubeadm ConfigMap cannot be read.
+            node_cidr=$($kc get node "$(hostname)" -o jsonpath='{.spec.podCIDR}' 2>/dev/null || true)
+            if [ -n "${node_cidr:-}" ]; then
+                cidr=$(printf '%s' "$node_cidr" | awk -F. 'NF==4 {printf "%s.%s.0.0/16", $1, $2}')
+                [ -n "$cidr" ] && log "pod subnet read from this node's podCIDR ($node_cidr): $cidr"
+            fi
+        fi
+        if [ -n "$endpoint" ] && [ -n "$cidr" ]; then
+            break
+        fi
+        sleep 2
+        i=$((i + 1))
+    done
     if [ -z "${endpoint:-}" ] || [ -z "${cidr:-}" ]; then
-        log "WARNING: could not read the API endpoint or the pod subnet; kube-proxy left unconfigured"
+        log "WARNING: could not read the API endpoint or the pod subnet within 60 s; kube-proxy left unconfigured"
+        log "WARNING: pods on this node will not reach Service addresses or cluster DNS until it is"
+        log "WARNING: fixed - re-run this join (kubeos-node-join '<string>') once the cluster is quiet"
+        # Stopping it is deliberate: a kube-proxy that cannot sync keeps the Service rules of
+        # the cluster this machine had before the join, and those DNAT cluster DNS to THIS node,
+        # where nothing listens. No rules at all is the honest, debuggable state.
+        systemctl stop kube-proxy >/dev/null 2>&1 || true
         return 0
     fi
+    log "kube-proxy will use $endpoint and pod subnet $cidr"
 
     # ServiceAccount + binding + non-expiring token. Adopt-or-create: a second node must reuse
     # the objects the first one made instead of racing them (the Secret is cluster-wide).
@@ -474,6 +511,14 @@ YAML
     fi
 
     systemctl enable kube-proxy >/dev/null 2>&1 || true
+    # Flush the Service rules the proxy wrote for the cluster this machine ran BEFORE the join.
+    # They survive a restart (same chain names) and would keep DNATing cluster DNS to this node,
+    # where nothing listens - the exact symptom measured on kubeos2 on 2026-11-19.
+    systemctl stop kube-proxy >/dev/null 2>&1 || true
+    for chain in $(iptables -t nat -S 2>/dev/null | awk '/^-N KUBE-/ {print $2}'); do
+        iptables -t nat -F "$chain" 2>/dev/null || true
+    done
+    iptables -t nat -F KUBE-SERVICES 2>/dev/null || true
     systemctl restart kube-proxy >/dev/null 2>&1 || true
     i=1
     while [ "$i" -le 10 ]; do
