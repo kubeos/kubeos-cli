@@ -388,24 +388,39 @@ install_kube_proxy() {
         log "kube-proxy is already running on this node"
         return 0
     fi
-    [ -r "$DASHBOARD_KUBECONFIG" ] || {
-        log "WARNING: no dashboard kubeconfig ($DASHBOARD_KUBECONFIG), so kube-proxy cannot get an"
-        log "         identity - pods on this node will not reach Service addresses."
-        return 0
-    }
-    kc="kubectl --kubeconfig=$DASHBOARD_KUBECONFIG"
+    # CREDENTIAL: never the dashboard kubeconfig. On a node that was its own control plane until a
+    # minute ago it still points at THAT cluster - adopt_dashboard re-points it only at the end -
+    # so `config view` answers happily with this node's own dead server and every API call fails.
+    # Measured 2026-11-20: kubeos2 and kubeos3 came out of the join with kube-proxy inactive, no
+    # /etc/kubernetes/kube-proxy.conf, no kube-proxy ServiceAccount anywhere, and the Service rules
+    # of the cluster they had just left still DNATing cluster DNS to themselves. The join string's
+    # handover kubeconfig is cluster-admin on the cluster we joined; kubelet.conf is the fallback.
+    if [ -r "$JOIN_DASHBOARD_CONF" ]; then
+        kc="kubectl --kubeconfig=$JOIN_DASHBOARD_CONF"
+    else
+        log "WARNING: this join string carried no dashboard kubeconfig, so kube-proxy cannot create"
+        log "         its own identity; falling back to the node credential (read-only)."
+        kc="kubectl --kubeconfig=/etc/kubernetes/kubelet.conf"
+    fi
     # Both values are read from the cluster, and BOTH reads can come back empty for a few
     # seconds after a join: the API is still settling and the dashboard identity may not be
     # able to read a kube-system ConfigMap yet. Giving up on the first empty answer is how
     # kubeos2 ended up with an unconfigured kube-proxy (2026-11-19) - and an unconfigured
     # kube-proxy is not "no proxy", it is the proxy of the cluster this machine ran BEFORE the
     # join, whose Service rules point at this node itself. So: retry, then fall back.
+    # ENDPOINT: the join string already names the cluster we joined, so take it from there first;
+    # otherwise read it from kubelet.conf, which is written by the join itself and can never be the
+    # stale file this step used to trust.
     endpoint=""
+    case "${JOIN_ENDPOINT:-}" in
+        *:*) endpoint="https://$JOIN_ENDPOINT" ;;
+    esac
     cidr=""
     i=1
     while [ "$i" -le 30 ]; do
         if [ -z "$endpoint" ]; then
-            endpoint=$($kc config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)
+            endpoint=$(kubectl --kubeconfig=/etc/kubernetes/kubelet.conf config view --minify \
+                -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)
         fi
         if [ -z "$cidr" ]; then
             cidr=$($kc -n kube-system get configmap kubeadm-config \
@@ -416,7 +431,11 @@ install_kube_proxy() {
             # Fallback: KubeOS always uses a /16 pod network and hands each node a /24 out of
             # it, so this node's own podCIDR identifies the cluster network even when the
             # kubeadm ConfigMap cannot be read.
-            node_cidr=$($kc get node "$(hostname)" -o jsonpath='{.spec.podCIDR}' 2>/dev/null || true)
+            # Step 4 already read the podCIDR the controller-manager assigned to this node.
+            node_cidr=${NODE_POD_CIDR:-}
+            if [ -z "$node_cidr" ]; then
+                node_cidr=$($kc get node "$(hostname)" -o jsonpath='{.spec.podCIDR}' 2>/dev/null || true)
+            fi
             if [ -n "${node_cidr:-}" ]; then
                 cidr=$(printf '%s' "$node_cidr" | awk -F. 'NF==4 {printf "%s.%s.0.0/16", $1, $2}')
                 [ -n "$cidr" ] && log "pod subnet read from this node's podCIDR ($node_cidr): $cidr"

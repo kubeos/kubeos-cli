@@ -1,3 +1,21 @@
+kubeos-cli (1.0.0-7) trixie; urgency=medium
+
+  * kubeos-node-join: take the kube-proxy identity from the cluster the node JUST JOINED,
+    not from its dashboard kubeconfig. On a freshly installed machine that kubeconfig still
+    points at the single-node cluster the installer brought up, and the join only re-points
+    it at the very end - so the kube-proxy step authenticated against a server this node had
+    already stopped: `config view` answered with the node's own address, every API call
+    failed, and after 60 s of retries the join gave up. Measured 2026-11-20 on a fresh
+    three-node cluster (installed from the packaged ISO): kubeos2 and kubeos3 joined, showed
+    Ready, and had kube-proxy inactive, no /etc/kubernetes/kube-proxy.conf, no kube-proxy
+    ServiceAccount, and the previous cluster's Service rules still in iptables DNATing
+    cluster DNS to themselves - so no pod on either worker could resolve a name.
+  * The endpoint now comes from the join string (or kubelet.conf, written by the join
+    itself), and the pod-subnet fallback reuses the podCIDR step 4 already read, so neither
+    value depends on a kubeconfig that may still describe the old cluster.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 00:30:00 +0530
+
 kubeos-cli (1.0.0-6) trixie; urgency=medium
 
   * kubeos-node-join: read the API endpoint and the pod subnet with retries, and fall back
