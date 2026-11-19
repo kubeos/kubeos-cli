@@ -1,3 +1,14 @@
+kubeos-cli (1.0.0-1kubeos4) trixie; urgency=medium
+
+  * kubeos-dashboard-install: decide "already installed" by the payload CHECKSUM, not by
+    RELEASE. Every kubeos-dashboard build of a version carries the same release directory
+    name, so `apt install --reinstall kubeos-dashboard` on a live node did nothing at all -
+    the old unpacked tree and its plugin directories stayed in place. Found when a rebuilt
+    dashboard package shipped a plugin under a different id and the node kept serving the
+    old one (measured 2026-11-19).
+  * It also prunes plugin directories the new release no longer carries, because the unpack
+    merges into the existing payload directory instead of replacing it.
+
 kubeos-cli (1.0.0-1kubeos3) trixie; urgency=medium
 
   * dh_installsystemd gets --no-enable only, not --no-start. --no-start also stops the

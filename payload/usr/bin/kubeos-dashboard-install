@@ -23,6 +23,7 @@ set -eu
 log() { printf 'kubeos-dashboard-install: %s\n' "$*"; }
 warn() { printf 'kubeos-dashboard-install: WARNING: %s\n' "$*" >&2; }
 
+STATE_DIR=/var/lib/kubeos
 PAYLOAD_DIR=/usr/share/kubeos/dashboard
 RELEASE_HOME=/root
 ADMIN_CONF=/etc/kubernetes/admin.conf
@@ -51,6 +52,13 @@ if [ ! -s "$PAYLOAD_DIR/RELEASE" ]; then
 fi
 RELEASE=$(cat "$PAYLOAD_DIR/RELEASE")
 TARBALL=$PAYLOAD_DIR/$RELEASE.tar.gz
+# RELEASE is the directory name inside the tarball and says nothing about the build: every
+# kubeos-dashboard release of the same version carries the same name. So "is the dashboard
+# already installed?" must be answered by the payload's CHECKSUM, not by that name. Without
+# this, `apt install --reinstall kubeos-dashboard` on a live node changed nothing at all - the
+# old unpacked tree (including an outdated plugin directory) stayed in place (measured
+# 2026-11-19 on a fresh install whose KubeOS pages were missing).
+PAYLOAD_SHA_MARKER=$STATE_DIR/dashboard.payload.sha256
 if [ ! -s "$TARBALL" ]; then
     warn "the payload is listed as $RELEASE but $TARBALL is missing - nothing to install"
     exit 0
@@ -58,10 +66,17 @@ fi
 
 # Already serving? Then this is a re-run on a healthy node: do not restart the dashboard under
 # the user who is looking at it.
+payload_sha=$(sha256sum "$TARBALL" 2>/dev/null | cut -d' ' -f1)
+installed_sha=$(cat "$PAYLOAD_SHA_MARKER" 2>/dev/null || true)
 if [ -x "$PAYLOAD_DIR/install.sh" ] && systemctl is-active --quiet "$FIRST_UNIT" &&
     wget --no-check-certificate -q -O /dev/null "https://127.0.0.1:$DASHBOARD_PORT/" 2>/dev/null; then
-    log "the dashboard is already installed and answering on https://<this-node>:$DASHBOARD_PORT/"
-    exit 0
+    if [ -n "${payload_sha:-}" ] && [ "$payload_sha" = "$installed_sha" ]; then
+        log "the dashboard is already installed and answering on https://<this-node>:$DASHBOARD_PORT/"
+        exit 0
+    fi
+    log "this payload has changed since the installed one - reinstalling the dashboard"
+    log "  installed: ${installed_sha:-unknown}"
+    log "  now:       ${payload_sha:-unknown}"
 fi
 
 # Verify the release before running it as root: the tarball carries the installer itself.
@@ -93,6 +108,17 @@ if [ ! -d "$WORK/$RELEASE" ]; then
 fi
 cp -a "$WORK/$RELEASE/." "$PAYLOAD_DIR/"
 chmod 0755 "$PAYLOAD_DIR/install.sh"
+# The unpack MERGES into the directory, so a plugin that a new release renamed or removed would
+# stay behind and keep being served (exactly what happened when the plugin id moved from
+# "kubeos" to "kubeos-branding" and back). Prune anything the current release does not carry.
+if [ -d "$WORK/$RELEASE/share/plugins" ]; then
+    for old in "$PAYLOAD_DIR"/share/plugins/*; do
+        [ -e "$old" ] || continue
+        [ -e "$WORK/$RELEASE/share/plugins/$(basename "$old")" ] && continue
+        log "removing $old (not part of release $RELEASE)"
+        rm -rf "$old"
+    done
+fi
 if [ -d "$RELEASE_HOME" ] && [ ! -d "$RELEASE_HOME/$RELEASE" ]; then
     cp -a "$WORK/$RELEASE" "$RELEASE_HOME/"
     log "kept a copy at $RELEASE_HOME/$RELEASE (the standalone rebuild uses it)"
@@ -119,6 +145,10 @@ i=1
 while [ "$i" -le "$WAIT_SECONDS" ]; do
     if wget --no-check-certificate -q -O /dev/null "https://127.0.0.1:$DASHBOARD_PORT/" 2>/dev/null; then
         log "the dashboard is serving: https://<this-node>:$DASHBOARD_PORT/ (login with this node's root password)"
+        if [ -n "${payload_sha:-}" ]; then
+            install -d -m 0755 "$STATE_DIR"
+            printf '%s\n' "$payload_sha" > "$PAYLOAD_SHA_MARKER"
+        fi
         rm -rf "$WORK"
         trap - EXIT INT TERM
         exit 0
