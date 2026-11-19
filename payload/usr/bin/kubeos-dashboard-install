@@ -1,0 +1,132 @@
+#!/bin/sh
+# KubeOS: install the web dashboard on a freshly installed node (first boot).
+#
+# WHEN   once, by kubeos-dashboard-install.service after node-setup has brought the cluster up,
+#        and by hand to repair a node:
+#            kubeos-dashboard-install          # install if it is not already serving
+#            systemctl status kubeos-dashboard kubeos-dashboard-auth kubeos-console
+#
+# WHY    The ISO ships the dashboard release (usr/share/kubeos/dashboard/) but the dashboard is
+#        three host services with their own identity, certificate and token - starting them is a
+#        real installation, not a unit that can simply be enabled in the image. Doing it here
+#        means a user goes from ISO to a working dashboard with no manual step (the goal in
+#        AGENTS.md section 1), and it is the same installer a joined node uses (kubeos-node-join
+#        looks for /usr/share/kubeos/dashboard/install.sh), so there is one code path, not two.
+#
+# SAFE   Idempotent and warn-only: it exits 0 when the dashboard is already serving, when this
+#        machine is not a control plane (a worker gets its dashboard from the join handover), and
+#        when the payload is missing (an ISO built without it). A failure here must never turn a
+#        working node into a broken one, so every error path ends in a WARNING, not a failed unit -
+#        the node is still a usable cluster without a dashboard.
+set -eu
+
+log() { printf 'kubeos-dashboard-install: %s\n' "$*"; }
+warn() { printf 'kubeos-dashboard-install: WARNING: %s\n' "$*" >&2; }
+
+PAYLOAD_DIR=/usr/share/kubeos/dashboard
+RELEASE_HOME=/root
+ADMIN_CONF=/etc/kubernetes/admin.conf
+DASHBOARD_PORT=30443
+CONSOLE_PORT=30444
+FIRST_UNIT=kubeos-dashboard
+UNITS="kubeos-dashboard kubeos-dashboard-auth kubeos-console"
+WAIT_SECONDS=60
+
+[ "$(id -u)" -eq 0 ] || { warn "run this as root"; exit 1; }
+
+# A worker has no admin.conf: its dashboard comes from the join string, not from this installer.
+if [ ! -s "$ADMIN_CONF" ]; then
+    log "not a control plane (no $ADMIN_CONF) - a joined worker gets its dashboard from the join"
+    exit 0
+fi
+
+# RELEASE holds the directory name INSIDE the tarball (kubeos-dashboard-<version>-linux-amd64).
+# It is not called VERSION on purpose: the release ships its own VERSION file (a metadata block)
+# which lands in this directory when the tarball is unpacked, and a marker with that name was
+# overwritten by it - the second run then looked for a tarball named after the whole metadata
+# block (measured on kubeos1, 2026-11-13).
+if [ ! -s "$PAYLOAD_DIR/RELEASE" ]; then
+    warn "no dashboard payload in this image ($PAYLOAD_DIR/RELEASE is missing) - nothing to install"
+    exit 0
+fi
+RELEASE=$(cat "$PAYLOAD_DIR/RELEASE")
+TARBALL=$PAYLOAD_DIR/$RELEASE.tar.gz
+if [ ! -s "$TARBALL" ]; then
+    warn "the payload is listed as $RELEASE but $TARBALL is missing - nothing to install"
+    exit 0
+fi
+
+# Already serving? Then this is a re-run on a healthy node: do not restart the dashboard under
+# the user who is looking at it.
+if [ -x "$PAYLOAD_DIR/install.sh" ] && systemctl is-active --quiet "$FIRST_UNIT" &&
+    wget --no-check-certificate -q -O /dev/null "https://127.0.0.1:$DASHBOARD_PORT/" 2>/dev/null; then
+    log "the dashboard is already installed and answering on https://<this-node>:$DASHBOARD_PORT/"
+    exit 0
+fi
+
+# Verify the release before running it as root: the tarball carries the installer itself.
+if [ -s "$PAYLOAD_DIR/SHA256" ]; then
+    expected=$(awk -v name="$(basename "$TARBALL")" '$2 == name { print $1; exit }' "$PAYLOAD_DIR/SHA256")
+    if [ -n "${expected:-}" ]; then
+        actual=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+        if [ "$expected" != "$actual" ]; then
+            warn "checksum mismatch for $TARBALL (expected $expected, got $actual) - refusing to install"
+            exit 1
+        fi
+        log "payload checksum verified"
+    else
+        warn "$PAYLOAD_DIR/SHA256 does not mention $(basename "$TARBALL") - installing unverified"
+    fi
+else
+    warn "no $PAYLOAD_DIR/SHA256 - installing unverified"
+fi
+
+# Unpack where the installer expects to live, and keep a copy under /root: kubeos-node-standalone
+# rebuilds a node from /root/kubeos-dashboard-<version>/install.sh, so its absence is a real loss.
+log "unpacking $RELEASE"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT INT TERM
+tar -xzf "$TARBALL" -C "$WORK" || { warn "could not unpack $TARBALL"; exit 1; }
+if [ ! -d "$WORK/$RELEASE" ]; then
+    warn "the tarball does not contain $RELEASE/ - refusing to install"
+    exit 1
+fi
+cp -a "$WORK/$RELEASE/." "$PAYLOAD_DIR/"
+chmod 0755 "$PAYLOAD_DIR/install.sh"
+if [ -d "$RELEASE_HOME" ] && [ ! -d "$RELEASE_HOME/$RELEASE" ]; then
+    cp -a "$WORK/$RELEASE" "$RELEASE_HOME/"
+    log "kept a copy at $RELEASE_HOME/$RELEASE (the standalone rebuild uses it)"
+fi
+
+# The installer does the work that needs judgement: it adopts the cluster CA (one CA per cluster,
+# never overwrite), issues this node's certificate, creates/keeps the console token, writes the
+# units and installs kubeos-trust-ca. --no-start because we start the three units together below.
+log "running the dashboard installer"
+if ! "$PAYLOAD_DIR/install.sh" --kubeconfig "$ADMIN_CONF" \
+        --port "$DASHBOARD_PORT" --console-port "$CONSOLE_PORT" --no-start; then
+    warn "the dashboard installer failed - this node is still a working cluster without a dashboard"
+    warn "diagnose with: journalctl -u $FIRST_UNIT -n 50; then re-run kubeos-dashboard-install"
+    exit 1
+fi
+
+# shellcheck disable=SC2086  # one unit name per word, by construction
+systemctl enable $UNITS >/dev/null 2>&1 || warn "could not enable $UNITS"
+# shellcheck disable=SC2086
+systemctl restart $UNITS >/dev/null 2>&1 || warn "could not restart $UNITS"
+
+# Wait for the login page, because "installed" is not the same as "serving".
+i=1
+while [ "$i" -le "$WAIT_SECONDS" ]; do
+    if wget --no-check-certificate -q -O /dev/null "https://127.0.0.1:$DASHBOARD_PORT/" 2>/dev/null; then
+        log "the dashboard is serving: https://<this-node>:$DASHBOARD_PORT/ (login with this node's root password)"
+        rm -rf "$WORK"
+        trap - EXIT INT TERM
+        exit 0
+    fi
+    sleep 2
+    i=$((i + 2))
+done
+
+warn "the units are enabled but $DASHBOARD_PORT did not answer within ${WAIT_SECONDS}s"
+warn "check: systemctl status $FIRST_UNIT; journalctl -u $FIRST_UNIT -n 50"
+exit 1

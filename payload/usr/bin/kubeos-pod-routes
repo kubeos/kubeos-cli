@@ -1,0 +1,106 @@
+#!/bin/sh
+# WHEN   Every 15 s on every node (`kubeos-pod-routes.timer`), and once at boot.
+# WHY    KubeOS's CNI is a per-node bridge with host-local IPAM and a default route *inside* the
+#        bridge. That was chosen on purpose: it keeps the base system free of a CNI DaemonSet and
+#        therefore of any Pod (user rule 2026-11-12). The price is that nothing connects one
+#        node's pod network to another's, so a pod on one machine cannot reach a pod - or a
+#        Service backed by a pod - on another. Measured 2026-11-13 on a 4-node cluster: every
+#        cross-node pair lost 100 % of its packets while same-node traffic was perfect
+#        (`10.244.0.0/24`, `10.244.13.0/24`, `10.244.14.0/24`, `10.244.15.0/24`, no routes
+#        between them).
+#
+#        This reconciler installs exactly the missing routes, on every node:
+#            <peer podCIDR>  via  <peer node InternalIP>
+#        No overlay, no tunnel, no extra daemon and no Pod - just the kernel's routing table,
+#        which is all a flat L2 network (the normal KubeOS setup) needs. A single-node install
+#        has no peers and the script does nothing at all.
+# SAFE   Re-runnable, idempotent (`ip route replace`) and cheap. It only ever removes routes it
+#        created itself, recorded in $STATE. It never fails a boot: a missing kubeconfig or an
+#        unreachable API only logs and exits 0, because a node must keep working (and keep its
+#        dashboard) even when the cluster it joined is away.
+set -eu
+
+log() { printf 'kubeos-pod-routes: %s\n' "$*"; }
+
+STATE=/var/lib/kubeos/pod-routes.state
+# The control plane reads its own admin kubeconfig; a worker has no cluster-wide credential of
+# its own, so it uses the identity its dashboard already has (a `kubeos-dashboard` service
+# account, cluster-admin, installed by the dashboard's own install.sh). A third path is offered
+# for a node that has neither - put any kubeconfig that may `get nodes` there.
+CONF_CANDIDATES="/etc/kubernetes/admin.conf /etc/kubeos-dashboard/kubeconfig /etc/kubeos/pod-routes.kubeconfig"
+KUBECTL=/usr/bin/kubectl
+IP=/usr/sbin/ip
+[ -x "$IP" ] || IP=/sbin/ip
+SYSCTL=/usr/sbin/sysctl
+
+[ -x "$KUBECTL" ] || { log "no kubectl on this node - nothing to reconcile"; exit 0; }
+[ -x "$IP" ] || { log "no ip command on this node - nothing to reconcile"; exit 0; }
+
+CONF=
+for candidate in $CONF_CANDIDATES; do
+    if [ -r "$candidate" ]; then CONF=$candidate; break; fi
+done
+if [ -z "$CONF" ]; then
+    log "no usable kubeconfig ($CONF_CANDIDATES) - this node cannot list the other nodes yet"
+    exit 0
+fi
+THIS_HOST=$(hostname)
+# `HOME` outside /root and an explicit cache dir: the dashboard's unit runs with
+# ProtectHome=yes, and kubectl needs somewhere to write. Harmless when run by root directly.
+KUBECTL="env HOME=/tmp $KUBECTL --kubeconfig $CONF --cache-dir /tmp/kubeos-pod-routes-cache"
+
+nodes=$($KUBECTL get nodes \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.podCIDR}{" "}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \
+    2>/dev/null) || nodes=
+if [ -z "$nodes" ]; then
+    log "the API did not answer ($CONF) - keeping the routes already in place"
+    exit 0
+fi
+
+# A pod on this node that leaves for another node's pod network has to be forwarded by the
+# kernel, which is off by default in some installs. Cheap, idempotent, and only when it is off.
+if [ -x "$SYSCTL" ] && [ "$("$SYSCTL" -n net.ipv4.ip_forward 2>/dev/null || echo 1)" != "1" ]; then
+    "$SYSCTL" -q -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || log "could not enable ip_forward"
+fi
+
+# Read LINE BY LINE (a `for` over $nodes would split on whitespace and destroy the three-field
+# records - measured, it silently produced one route instead of three).
+nodefile=$(mktemp) || exit 0
+printf '%s\n' "$nodes" > "$nodefile"
+wanted=""
+while IFS=' ' read -r name cidr address; do
+    if [ -z "${name:-}" ] || [ -z "${cidr:-}" ] || [ -z "${address:-}" ]; then
+        continue
+    fi
+    if [ "$name" = "$THIS_HOST" ]; then
+        continue
+    fi
+    case " $wanted " in
+        *" $cidr "*) ;;
+        *) wanted="$wanted $cidr $address" ;;
+    esac
+    # replace, not add: a re-join or an IP change must not stack duplicate routes.
+    if ! "$IP" route replace "$cidr" via "$address" 2>/dev/null; then
+        log "WARNING: could not route $cidr via $address (node $name) - is that address reachable?"
+        continue
+    fi
+done < "$nodefile"
+rm -f "$nodefile"
+
+# Prune what this script added earlier and that is no longer wanted (a node was removed, or its
+# podCIDR changed). Only routes recorded in $STATE are ever deleted.
+if [ -r "$STATE" ]; then
+    while read -r cidr address; do
+        if [ -z "${cidr:-}" ] || [ -z "${address:-}" ]; then
+            continue
+        fi
+        case " $wanted " in
+            *" $cidr "*) ;;
+            *) "$IP" route del "$cidr" via "$address" 2>/dev/null || true ;;
+        esac
+    done < "$STATE"
+fi
+
+mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
+printf '%s\n' "$wanted" | tr ' ' '\n' | sed '/^$/d' | paste - - 2>/dev/null > "$STATE" || true
+exit 0

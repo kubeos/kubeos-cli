@@ -1,0 +1,13 @@
+[Unit]
+Description=KubeOS pod routes: connect this node's pod network to the other nodes
+Documentation=file:/usr/bin/kubeos-pod-routes
+# The routes are only useful once the node has a network and a cluster to ask; both may arrive
+# long after boot, which is why the timer re-runs this instead of relying on ordering here.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/kubeos-pod-routes
+# Never fails a boot: the script itself exits 0 when it has nothing to do or no credentials yet.
+SuccessExitStatus=0 1

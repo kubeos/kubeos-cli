@@ -1,0 +1,15 @@
+[Unit]
+Description=KubeOS pod routes: reconcile them every 15 s
+Documentation=file:/usr/bin/kubeos-pod-routes
+
+[Timer]
+# A node can appear, disappear or change its address at any time (that is the point of a cluster
+# you attach machines to), and there is no API watch to piggy-back on without adding a daemon, so
+# a short poll it is. The script is a no-op when nothing changed: one kubectl call and no writes.
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=1s
+Unit=kubeos-pod-routes.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+# KubeOS: check the control-plane certificates every week, renew when 30 days are left.
+#
+# 03:30 with a random delay, so a fleet installed together does not renew together; Persistent
+# so a machine that was off still checks. Renewal means a few seconds without the API, and the
+# running pods are not touched (see kubeos-cert-renew).
+[Unit]
+Description=KubeOS weekly certificate check
+Documentation=https://kubeos.in/
+
+[Timer]
+OnCalendar=Sun *-*-* 03:30:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=kubeos-cert-renew.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,238 @@
+#!/bin/sh
+# KubeOS: keep the control-plane certificates from expiring (they are issued for 365 days).
+#
+# WHEN   weekly by kubeos-cert-renew.timer (Sunday 03:30, randomised - see the unit), and by
+#        hand when the doctor says the certificates are close:
+#            kubeos-cert-renew              # renew if anything expires within $RENEW_BEFORE_DAYS
+#            kubeos-cert-renew --force       # renew now, whatever the remaining time
+#
+# WHY    `kubeadm` issues every control-plane leaf with a 365-day lifetime, and the normal way to
+#        refresh them is `kubeadm upgrade` - which this platform does not have yet. Without this
+#        unit a KubeOS node simply STOPS WORKING on the anniversary of its install: the API
+#        server, controller-manager, scheduler and etcd all fail to authenticate against each
+#        other and the cluster never comes back. Measured on the test fleet: the leaves installed
+#        2026-11-13 expire 2027-11-12 (the CA itself runs to 2036).
+#
+# WHY IT RESTARTS THINGS: renewing writes new files, but a running process keeps the certificate
+# it loaded at start, so the API server and friends have to be restarted to pick them up. That
+# restart is the only downtime this script can cause, and it is bounded:
+#   - pods are NOT restarted (they live in containerd; a kubelet restart does not touch them)
+#   - iptables rules are already in the kernel, so Service traffic keeps flowing
+#   - the API is unreachable for a few seconds while kube-apiserver (and, only if its own
+#     certificate was renewed, etcd) comes back
+# which is why it runs at 03:30 after a fresh backup, one component at a time, each gated on a
+# health check, and stops instead of pushing on.
+#
+# SAFE   Re-runnable, and it does nothing at all unless a certificate is inside the window (or
+#        --force is given). It never deletes the previous keys, and it refuses to start without a
+#        verified backup: the etcd snapshot and /etc/kubernetes/{pki,*.conf} go to
+#        $BACKUP_ROOT/<timestamp>/ and the rollback is two commands, printed on failure.
+set -eu
+
+log() { printf 'kubeos-cert-renew: %s\n' "$*"; }
+warn() { printf 'kubeos-cert-renew: WARNING: %s\n' "$*" >&2; }
+
+RENEW_BEFORE_DAYS=30
+BACKUP_ROOT=/var/lib/kubeos/cert-backup
+KEEP_BACKUPS=3
+KUBE=/etc/kubernetes
+PKI=$KUBE/pki
+ADMIN_CONF=$KUBE/admin.conf
+READY_TIMEOUT=90
+FORCE=0
+
+for arg in "$@"; do
+    case $arg in
+        --force) FORCE=1 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        *) warn "unknown argument: $arg"; exit 2 ;;
+    esac
+done
+
+[ "$(id -u)" -eq 0 ] || { warn "run this as root"; exit 1; }
+
+# A worker has no control plane to renew: kubelet rotates its own client certificate.
+if [ ! -s "$ADMIN_CONF" ] || [ ! -d "$PKI" ]; then
+    log "not a control plane (no $ADMIN_CONF) - nothing to renew here"
+    exit 0
+fi
+
+kubectl_admin() { kubectl --kubeconfig "$ADMIN_CONF" "$@"; }
+
+# --- how long has the nearest certificate got? -------------------------------
+# Days until `notAfter` of a certificate file (or of the certificate embedded in a kubeconfig).
+days_left() {
+    _file=$1
+    if [ ! -s "$_file" ]; then
+        return 0
+    fi
+    case $_file in
+        *.conf)
+            _tmp=$(mktemp)
+            awk '/client-certificate-data:/{print $2; exit}' "$_file" | base64 -d > "$_tmp" 2>/dev/null ||
+                { rm -f "$_tmp"; return 0; }
+            _end=$(openssl x509 -in "$_tmp" -noout -enddate 2>/dev/null | cut -d= -f2) || _end=""
+            rm -f "$_tmp"
+            ;;
+        *)
+            _end=$(openssl x509 -in "$_file" -noout -enddate 2>/dev/null | cut -d= -f2) || _end=""
+            ;;
+    esac
+    [ -n "${_end:-}" ] || return 0
+    _epoch=$(date -d "$_end" +%s 2>/dev/null) || return 0
+    echo $(( (_epoch - $(date +%s)) / 86400 ))
+}
+
+nearest=99999
+nearest_what=""
+for entry in \
+    "$PKI/apiserver.crt" "$PKI/apiserver-kubelet-client.crt" "$PKI/apiserver-etcd-client.crt" \
+    "$PKI/front-proxy-client.crt" "$PKI/etcd/server.crt" "$PKI/etcd/peer.crt" \
+    "$PKI/etcd/healthcheck-client.crt" \
+    "$KUBE/admin.conf" "$KUBE/controller-manager.conf" "$KUBE/scheduler.conf"
+do
+    _days=$(days_left "$entry")
+    [ -n "$_days" ] || continue
+    if [ "$_days" -lt "$nearest" ]; then
+        nearest=$_days
+        nearest_what=$entry
+    fi
+done
+
+if [ "$nearest" -eq 99999 ]; then
+    warn "could not read any certificate expiry - not touching anything"
+    exit 1
+fi
+
+log "nearest expiry: $(basename "$nearest_what") in $nearest day(s)"
+if [ "$FORCE" -eq 0 ] && [ "$nearest" -gt "$RENEW_BEFORE_DAYS" ]; then
+    log "nothing to do (threshold $RENEW_BEFORE_DAYS days)"
+    exit 0
+fi
+
+# --- 1. a backup, or nothing happens ----------------------------------------
+STAMP=$(date +%Y%m%dT%H%M%SZ)
+DEST=$BACKUP_ROOT/$STAMP
+umask 077
+mkdir -p "$DEST"
+log "backing up to $DEST"
+
+if ! ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+        --cacert="$PKI/etcd/ca.crt" --cert="$PKI/etcd/server.crt" --key="$PKI/etcd/server.key" \
+        snapshot save "$DEST/etcd-snapshot.db" >/dev/null 2>&1; then
+    rm -rf "$DEST"
+    warn "could not take an etcd snapshot; refusing to renew certificates without a backup"
+    exit 1
+fi
+cp -a "$PKI" "$DEST/pki" || { warn "could not copy $PKI"; exit 1; }
+for conf in admin.conf controller-manager.conf scheduler.conf kubelet.conf; do
+    if [ -f "$KUBE/$conf" ]; then
+        cp -a "$KUBE/$conf" "$DEST/"
+    fi
+done
+if [ ! -s "$DEST/etcd-snapshot.db" ] || [ ! -d "$DEST/pki" ]; then
+    warn "the backup looks incomplete; refusing to continue"
+    exit 1
+fi
+chmod -R go-rwx "$DEST" 2>/dev/null || true
+
+ROTATE=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null |
+    sort -n | awk '{ sub(/^[^ ]+ /, ""); print }' | head -n -"$KEEP_BACKUPS" || true)
+for old in $ROTATE; do
+    [ -d "$old" ] && [ "$old" != "$DEST" ] && rm -rf "$old"
+done
+
+restore_hint() {
+    warn "rollback: systemctl stop kube-apiserver kube-controller-manager kube-scheduler etcd"
+    warn "rollback: cp -a $DEST/pki/. $PKI/ && cp -a $DEST/admin.conf $DEST/controller-manager.conf $DEST/scheduler.conf $KUBE/"
+    warn "rollback: systemctl start etcd kube-apiserver kube-controller-manager kube-scheduler"
+}
+
+# --- 2. renew (writes files only; nothing is restarted yet) ------------------
+if ! kubeadm certs renew all > /dev/null 2>&1; then
+    warn "kubeadm certs renew all failed - certificates NOT replaced"
+    exit 1
+fi
+log "certificates renewed; restarting the control plane one component at a time"
+
+# Wait for the API to answer, up to READY_TIMEOUT seconds.
+wait_api() {
+    _i=1
+    while [ "$_i" -le "$READY_TIMEOUT" ]; do
+        if kubectl_admin get --raw=/readyz >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
+wait_etcd() {
+    _i=1
+    while [ "$_i" -le "$READY_TIMEOUT" ]; do
+        if ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+                --cacert="$PKI/etcd/ca.crt" --cert="$PKI/etcd/server.crt" \
+                --key="$PKI/etcd/server.key" endpoint health >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
+# etcd first: the API server must find a healthy store behind it. Then the API server, then the
+# components that talk to it. kubelet last, and it does not touch the running pods.
+restart_unit() {
+    _unit=$1
+    _gate=$2
+    if ! systemctl is-enabled "$_unit" >/dev/null 2>&1 && ! systemctl is-active "$_unit" >/dev/null 2>&1; then
+        log "$_unit is not installed - skipped"
+        return 0
+    fi
+    systemctl restart "$_unit" || { warn "could not restart $_unit"; restore_hint; exit 1; }
+    case $_gate in
+        etcd)
+            wait_etcd || { warn "etcd did not become healthy after the restart"; restore_hint; exit 1; } ;;
+        api)
+            wait_api || { warn "the API did not become ready after restarting $_unit"; restore_hint; exit 1; } ;;
+        *) : ;;
+    esac
+    log "$_unit restarted"
+}
+
+restart_unit etcd etcd
+restart_unit kube-apiserver api
+restart_unit kube-controller-manager api
+restart_unit kube-scheduler api
+restart_unit kube-proxy api
+restart_unit kubelet api
+
+if ! wait_api; then
+    warn "the API is not ready after the renewal"
+    restore_hint
+    exit 1
+fi
+
+# --- 3. the dashboard's own leaf, re-signed by the same cluster CA -----------
+installer=""
+for candidate in /usr/share/kubeos/dashboard/install.sh /root/kubeos-dashboard-*/install.sh; do
+    [ -x "$candidate" ] && { installer=$candidate; break; }
+done
+if [ -n "$installer" ]; then
+    if "$installer" --kubeconfig /etc/kubeos-dashboard/kubeconfig --no-start >/dev/null 2>&1; then
+        systemctl restart kubeos-dashboard kubeos-dashboard-auth kubeos-console >/dev/null 2>&1 || true
+        log "re-signed this node's dashboard certificate"
+    else
+        warn "the dashboard's installer failed; its certificate was left alone"
+    fi
+fi
+
+# --- 4. say what actually happened ------------------------------------------
+log "done; the new expiry is:"
+for entry in "$PKI/apiserver.crt" "$PKI/etcd/server.crt"; do
+    [ -s "$entry" ] && log "  $(basename "$entry"): $(openssl x509 -in "$entry" -noout -enddate | cut -d= -f2)"
+done
+log "backup kept at $DEST"
+exit 0

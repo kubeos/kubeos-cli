@@ -1,0 +1,16 @@
+[Unit]
+Description=KubeOS disk report: publish LVM facts for the dashboard
+Documentation=https://kubeos.in/
+# Only on an installed system, never in the live session.
+ConditionKernelCommandLine=!boot=live
+# The API has to exist before the ConfigMap can be written; the timer starts
+# after first boot in any case, and the script exits 0 when there is no API yet.
+After=node-setup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/kubeos-disks-report
+# Journal only, like the node setup unit: nothing here should ever paint over
+# the console or a login prompt.
+StandardOutput=journal
+StandardError=journal

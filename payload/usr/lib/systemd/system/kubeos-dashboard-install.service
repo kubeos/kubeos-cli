@@ -1,0 +1,28 @@
+# KubeOS: install the shipped web dashboard on a node that has just been set up.
+#
+# WHY A UNIT AND NOT A LINE IN node-ready: node-ready's job ends when the node is Ready, and the
+# dashboard installation has to happen after that (it needs the API, the cluster CA Secret and the
+# node's own certificate). Keeping it separate also means a failed dashboard install cannot make
+# first boot look broken - this unit warns, the node stays a working cluster, and a repair is
+# simply `systemctl restart kubeos-dashboard-install`.
+#
+# The script is idempotent: it exits immediately when the dashboard is already answering, and on
+# a worker (no admin.conf) where the join handover owns the dashboard.
+[Unit]
+Description=KubeOS dashboard install (the release shipped in this image)
+Documentation=https://kubeos.in/
+After=node-setup.service kubelet.service network-online.target
+Wants=node-setup.service
+ConditionPathExists=/etc/kubernetes/admin.conf
+ConditionPathExists=/usr/share/kubeos/dashboard/RELEASE
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/kubeos-dashboard-install
+# Installing means writing root-owned files, generating a certificate and touching three units.
+TimeoutStartSec=600
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

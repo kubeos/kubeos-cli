@@ -1,0 +1,176 @@
+#!/bin/sh
+# KubeOS first boot, part 2: prove the node is usable and mark first boot done.
+#
+# WHEN   Runs right after node-setup, from the same
+#        node-setup.service (part 1 builds the services, part 2 checks them).
+# WHY    Part 1 starts the host services; this part answers one question only - is
+#        the node actually usable - and writes the marker that makes the unit
+#        skip itself on later boots. It applies NOTHING any more: the RBAC and the
+#        kube-dns Service/EndpointSlice are part of part 1, and Calico,
+#        metrics-server and local-path-provisioner are no longer applied at all,
+#        because they were Pods and the whole point of the migration is that a
+#        fresh node has no base Pods (docs/NATIVE-CONTROL-PLANE.md).
+# SAFE   Idempotent and read-only apart from the disk-report timer and the marker.
+#        The checks exit non-zero so the unit retries: a node whose control plane
+#        half-started is worse than one that visibly failed.
+set -eu
+
+export KUBECONFIG=/etc/kubernetes/admin.conf
+MARKER=/var/lib/kubeos/initialized
+WAIT_TOTAL=300   # seconds a single wait may take before we give up
+# Port the dashboard is published on. Keep in sync with node-setup (DASHBOARD_PORT)
+# and with the dashboard chart (~/kubeos-dashboard/deploy/values.yaml, nodePort).
+DASHBOARD_PORT=30443
+# Every unit part 1 starts, in the order a human would check them.
+UNITS="etcd kube-apiserver kube-controller-manager kube-scheduler kube-proxy kubeos-coredns kubeos-metrics-server kubeos-storage-provisioner"
+# The control plane cannot work without these; the last two are BEST EFFORT by design - node-setup
+# warns and carries on when metrics-server or the storage provisioner fails to start, and then this
+# script used to exit 1 anyway, which meant the "first boot done" marker was never written and
+# systemd restarted the whole chain every 60 s: the machine never got a dashboard, for a warning.
+REQUIRED_UNITS="etcd kube-apiserver kube-controller-manager kube-scheduler kube-proxy kubeos-coredns"
+OPTIONAL_UNITS="kubeos-metrics-server kubeos-storage-provisioner"
+
+log() { echo "node-ready: $*"; }
+
+wait_for() {
+    desc="$1"
+    shift
+    deadline=$(( $(date +%s) + WAIT_TOTAL ))
+    while ! "$@" >/dev/null 2>&1; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            log "TIMEOUT after ${WAIT_TOTAL}s waiting for: $desc"
+            return 1
+        fi
+        sleep 5
+    done
+    log "ready: $desc"
+}
+
+# 1. The API server has to answer before anything else is meaningful.
+wait_for "kube-apiserver" kubectl get --raw /readyz
+
+# 2. Every host service must be running. A unit that is merely "enabled" is not
+#    enough: etcd can be up while the apiserver crash-loops behind it.
+failed=""
+for unit in $UNITS; do
+    if systemctl is-active --quiet "${unit}.service"; then
+        log "active: ${unit}.service"
+    else
+        case " $REQUIRED_UNITS " in
+            *" $unit "*)
+                log "ERROR: ${unit}.service is not active:"
+                systemctl --no-pager --lines=10 status "${unit}.service" || true
+                failed="$failed $unit"
+                ;;
+            *)
+                case " $OPTIONAL_UNITS " in
+                    *" $unit "*)
+                        log "WARNING: ${unit}.service is not active (best effort - continuing):"
+                        systemctl --no-pager --lines=5 status "${unit}.service" || true
+                        ;;
+                esac
+                ;;
+        esac
+    fi
+done
+[ -z "$failed" ] || { log "ERROR: not running:$failed"; exit 1; }
+
+# 3. The node must be registered and Ready - that is the proof the CNI works.
+wait_for "node Ready" sh -c 'kubectl get nodes --no-headers 2>/dev/null | grep -qw Ready'
+
+# 4. Nothing base may be scheduled: with the control plane, CNI, DNS and the
+#    kube-proxy all being host services, a fresh node has no Pods at all. This is a
+#    hard check, not a warning: if something appears here the migration regressed,
+#    and silently continuing would hide exactly the defect this design removed.
+pod_count=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | grep -c . || true)
+case "$pod_count" in
+    0)
+        log "no Pods on this node, as designed"
+        ;;
+    *)
+        log "WARNING: $pod_count Pod(s) are present on a fresh node:"
+        kubectl get pods --all-namespaces --no-headers 2>/dev/null | sed 's/^/WARNING:   /'
+        log "WARNING: expected none - the base components should all be systemd services"
+        ;;
+esac
+
+# 5. Cluster DNS answers through the kube-dns ClusterIP, so pods can resolve both
+#    Kubernetes names and external ones. Checked from the node against the service
+#    address the EndpointSlice points at (there is no pod to test from yet).
+dns_ip=$(kubectl -n kube-system get service kube-dns -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+if [ -n "$dns_ip" ]; then
+    log "DNS service address: $dns_ip"
+else
+    log "WARNING: the kube-dns Service is missing; pods will have no DNS service"
+fi
+
+# 6. The metrics API (decision D5, host service). `kubectl top` is what users ask
+#    for by name, so it is checked through the real client path rather than by
+#    asking the unit whether it is active. Warn-only on purpose: metrics are a
+#    nice-to-have next to a working node, and blocking first boot here would turn
+#    a cosmetic defect into an unusable machine (the same rule the old Pod-based
+#    step 6 followed).
+metrics_state=$(kubectl get apiservice v1beta1.metrics.k8s.io \
+    -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+if kubectl top nodes >/dev/null 2>&1; then
+    log "metrics API available: $(kubectl top nodes --no-headers 2>/dev/null | sed 's/  */ /g' | head -1)"
+elif [ "$metrics_state" = "True" ]; then
+    log "WARNING: the metrics APIService is Available but 'kubectl top' returned nothing yet"
+else
+    log "WARNING: the metrics API is not Available (state: ${metrics_state:-unknown}); 'kubectl top' will not work"
+    log "WARNING: inspect with: systemctl status kubeos-metrics-server; kubectl get apiservice v1beta1.metrics.k8s.io -o yaml"
+fi
+
+# 7. Disk report for the dashboard. The dashboard runs as a pod and cannot run
+#    vgs/lvs, so this node publishes its LVM facts as a ConfigMap, refreshed by
+#    kubeos-disks-report.timer. Warn-only: a dashboard page without disk data is
+#    cosmetic and must never fail first boot.
+if systemctl enable --now kubeos-disks-report.timer >/dev/null 2>&1; then
+    log "disk report timer enabled (ConfigMap kubeos-system/kubeos-disks)"
+else
+    log "WARNING: could not enable kubeos-disks-report.timer; the dashboard's Disks page will be empty"
+fi
+
+# 8. The login banner: while setup runs, /etc/issue says so; afterwards it explains
+#    the node and where the dashboard is. A user who reboots into a first boot
+#    should be told why the prompt takes a while instead of being left guessing (the
+#    banner names no duration on purpose - a printed estimate is a promise the
+#    machine breaks on slow storage), and the final banner documents the host-service
+#    design without needing a manual step. The address is substituted here because
+#    /etc/issue.final is static in the image and the node address is per machine.
+#    Keep DASHBOARD_PORT in sync with node-setup and with the dashboard chart
+#    (~/kubeos-dashboard/deploy/values.yaml, service.nodePort).
+if [ -f /etc/issue.final ]; then
+    banner_ip="$(sed -n 's/^NODE_IP=//p' /etc/kubeos/cluster-network.conf 2>/dev/null | head -n 1)"
+    sed "s|__KUBEOS_NODE_IP__|${banner_ip:-this-node}|g" /etc/issue.final > /etc/issue
+    log "login banner switched to the normal one (dashboard https://${banner_ip:-this-node}:${DASHBOARD_PORT})"
+fi
+
+# 9. Dynamic storage (host service, no Pods, no container image). Warn-only: a node
+#    without dynamic storage still runs containers, it just cannot bind a claim, and
+#    that must not stop first boot from finishing. There is deliberately NO test claim
+#    here - with WaitForFirstConsumer a claim only binds once a Pod consumes it, so a
+#    real self-test would have to create a Pod, which would trip step 4 above.
+if kubectl get storageclass local-path >/dev/null 2>&1; then
+    log "storage: StorageClass local-path is present"
+    if [ -d /opt/local-path-provisioner ]; then
+        log "storage: volume root /opt/local-path-provisioner is mounted"
+    else
+        log "WARNING: /opt/local-path-provisioner is missing; dynamic storage cannot work"
+    fi
+    if systemctl is-active --quiet kubeos-storage-provisioner.service; then
+        log "storage: kubeos-storage-provisioner is active"
+    else
+        log "WARNING: kubeos-storage-provisioner is not active; claims will stay Pending"
+        log "WARNING: check: systemctl status kubeos-storage-provisioner; journalctl -u kubeos-storage-provisioner -b"
+    fi
+else
+    log "WARNING: no local-path StorageClass; every PVC will stay Pending"
+fi
+
+# 10. Success marker: node-setup.service uses it as its "already done"
+#    condition (ConditionPathExists=!/var/lib/kubeos/initialized).
+mkdir -p /var/lib/kubeos
+date -u +'%Y-%m-%dT%H:%M:%SZ' > "$MARKER"
+chmod 0644 "$MARKER"
+log "first boot complete"

@@ -1,0 +1,103 @@
+# KubeOS: attach an existing NFS export as a PersistentVolume (static).
+#
+# This file is an EXAMPLE - KubeOS never applies it. Copy it, edit the two
+# placeholders, apply it. It exists because KubeOS has no NFS *server* and no NFS
+# provisioner: dynamic local storage is a host service
+# (/usr/bin/kubeos-storage-provisioner) that makes hostPath volumes, which are
+# node-local and only ever ReadWriteOnce. NFS is how a KubeOS node reaches storage
+# that lives somewhere else, or that several Pods must write at once.
+#
+# WHAT THE ISO PROVIDES: the client side only, package `nfs-common` (mount.nfs and
+# friends). The kernel NFS client (nfs.ko) was always there, but without
+# nfs-common every mount failed with a wrong-fs-type error and the Pod never
+# started - measured 2026-11-11 on an installed node.
+#
+# WHAT YOU MUST KNOW BEFORE APPLYING THIS
+#   * `server` and `path` are YOUR export. <NAS-IP> and /export/kubeos below are
+#     placeholders; `showmount -e <NAS-IP>` lists what the server offers.
+#   * The export must allow this node to mount it AND to write as the UIDs your
+#     Pods use. With root_squash (the NFS default) a Pod running as root writes as
+#     nobody; either use `no_root_squash` on the export or set
+#     `securityContext.fsGroup` on the Pod so the volume is group-writable.
+#   * `ReadWriteMany` is honest here: NFS really does allow it, unlike hostPath.
+#   * `Retain` is deliberate and different from the local-path class (which uses
+#     Delete). An NFS export usually holds data that outlives the claim, and a
+#     single typo in a claim name should never delete somebody's files. Delete the
+#     directory yourself when you mean it.
+#   * There is no dynamic provisioner: one PV per volume, declared here. If you
+#     want many claims served automatically, that is a different component (an
+#     NFS subdir provisioner, which is a Pod and an image - not what KubeOS ships).
+#   * `nfs-common` DEPENDS on `rpcbind` (checked in the 2.8.3-1 package metadata),
+#     and Debian enables rpcbind.socket, which listens on port 111. NFSv3 needs it;
+#     the NFSv4.1 mountOptions below do NOT. On a node that only uses v4 you can
+#     turn the listener off without removing the package:
+#         systemctl disable --now rpcbind.socket rpcbind.service
+#     Do that only after confirming every NFS mount on this node is v4 (mount | grep nfs).
+#
+# HOW TO VERIFY IT WORKS
+#   kubectl apply -f nfs-static-pv.yaml
+#   kubectl get pv nfs-kubeos-01          # STATUS Bound, CLAIM set
+#   kubectl get pvc -n default nfs-claim  # STATUS Bound
+#   kubectl run nfs-test --image=registry.k8s.io/pause:3.10.2 --restart=Never \
+#     --overrides='{"spec":{"containers":[{"name":"nfs-test",
+#       "image":"registry.k8s.io/pause:3.10.2","volumeMounts":[{"name":"v",
+#       "mountPath":"/data"}]}],"volumes":[{"name":"v","persistentVolumeClaim":
+#       {"claimName":"nfs-claim"}}]}}'
+#   kubectl get pod nfs-test      # Running = the kubelet mounted the export
+#   kubectl describe pv nfs-kubeos-01   # any mount error appears on the Pod, not here
+#
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-static
+  labels:
+    kubeos.in/component: nfs
+provisioner: kubernetes.io/no-provisioner
+# Immediate, NOT WaitForFirstConsumer: an NFS volume is not tied to a node, so
+# there is nothing to wait for - the claim may bind the moment it is created. (The
+# local-path class must wait, because it builds a node-specific hostPath PV.)
+volumeBindingMode: Immediate
+reclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs-kubeos-01
+spec:
+  capacity:
+    storage: 20Gi          # documentation only: NFS does not enforce a quota here
+  accessModes:
+    - ReadWriteMany
+  volumeMode: Filesystem
+  storageClassName: nfs-static
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions:
+    # NFSv4.1 needs no rpcbind and no portmapper on the client; NFSv3 does. Pin the
+    # protocol rather than letting the kernel negotiate: a v4 export and a default
+    # v3 mount fail with "protocol not supported" and the reason is easy to miss.
+    - nfsvers=4.1
+    - hard              # keep retrying instead of failing a write mid-flight
+    - timeo=600
+    - retrans=2
+  nfs:
+    server: <NAS-IP>      # e.g. 192.168.1.10
+    path: /export/kubeos  # the exported directory, NOT a subdirectory of it
+    readOnly: false
+---
+# One claim per exported directory. `storageClassName` + capacity + accessModes are
+# what make it match nfs-kubeos-01; `volumeName` pins it to that exact PV, which is
+# worth doing when several PVs of the same size exist.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-claim
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: nfs-static
+  volumeName: nfs-kubeos-01
+  resources:
+    requests:
+      storage: 20Gi

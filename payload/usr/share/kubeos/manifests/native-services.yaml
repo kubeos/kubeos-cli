@@ -1,0 +1,383 @@
+# KubeOS: identities and endpoints the host services need, created at first boot.
+#
+# WHEN   Applied by /usr/bin/node-setup once the API server answers, after
+#        the certificates and kubeconfigs exist.
+# WHY    Nothing here is a workload, so none of it is a Pod:
+#        - flanneld and kubeos-coredns authenticate with client certificates minted
+#          at first boot (CN=system:flannel, CN=system:coredns); these bindings give
+#          those users exactly what their binaries ask for.
+#        - kube-proxy authenticates as system:kube-proxy, which kubeadm's addon
+#          normally binds to system:node-proxier for you. Without this binding
+#          kube-proxy starts, cannot list Services, and silently programs nothing.
+#        - kube-dns is the address pods ask for. With no selector the endpoint-slice
+#          controller ignores it completely, so the EndpointSlice below is the only
+#          source of truth and it points at the node IP, where kubeos-coredns
+#          listens.
+# SAFE   Idempotent: `kubectl apply` on every object. The EndpointSlice name is
+#        stable so a re-run replaces its addresses instead of stacking new slices.
+#
+# Substituted by node-setup before apply:
+#   __KUBEOS_DNS_SERVICE_IP__   the cluster IP for kube-dns (10th address of the
+#                               service range, the kubeadm convention)
+#   __KUBEOS_METRICS_SERVICE_IP__ the cluster IP for metrics-server (11th address -
+#                               pinned, because the serving certificate carries it
+#                               as a SAN: the API server dials the ClusterIP, so it
+#                               verifies the certificate against the IP, not a name)
+#   __KUBEOS_NODE_IP__          where kubeos-coredns and kubeos-metrics-server listen
+#   __KUBEOS_CA_BUNDLE__        base64 of /etc/kubernetes/pki/ca.crt, so the API
+#                               server can verify the metrics-server serving cert
+---
+# admin.conf's certificate carries O=kubeadm:cluster-admins (verified on an
+# installed node), and the ClusterRoleBinding that turns that group into
+# cluster-admin is created by `kubeadm init` - which this design deliberately never
+# runs. Without it every kubectl call as kubernetes-admin is "Forbidden", including
+# the rest of first boot, so it is created here first. Harmless if kubeadm or an
+# operator already made it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeadm:cluster-admins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: kubeadm:cluster-admins
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeos:flannel
+rules:
+  # flanneld reads each node's podCIDR and records its own subnet in annotations.
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeos:flannel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeos:flannel
+subjects:
+  - kind: User
+    name: system:flannel
+    apiGroup: rbac.authorization.k8s.io
+---
+# kubeadm normally ships this inside its kube-proxy addon.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeos:kube-proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:node-proxier
+subjects:
+  - kind: User
+    name: system:kube-proxy
+    apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeos:coredns
+rules:
+  # This is the set the upstream coredns ClusterRole uses, minus what a single-node
+  # host service never asks for (persistentvolumes, poddisruptionbudgets).
+  - apiGroups: [""]
+    resources: ["namespaces", "services", "pods", "endpoints"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeos:coredns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeos:coredns
+subjects:
+  - kind: User
+    name: system:coredns
+    apiGroup: rbac.authorization.k8s.io
+---
+# No selector on purpose: see the header. With a selector the endpoint-slice
+# controller would manage this Service and empty it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-dns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    kubernetes.io/name: CoreDNS
+spec:
+  type: ClusterIP
+  clusterIP: __KUBEOS_DNS_SERVICE_IP__
+  ports:
+    - name: dns
+      port: 53
+      protocol: UDP
+      targetPort: 53
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: 53
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: kube-dns-kubeos
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    kubernetes.io/service-name: kube-dns
+addressType: IPv4
+ports:
+  - name: dns
+    port: 53
+    protocol: UDP
+  - name: dns-tcp
+    port: 53
+    protocol: TCP
+endpoints:
+  - addresses:
+      - __KUBEOS_NODE_IP__
+    conditions:
+      ready: true
+---
+# --- metrics-server, host service (decision D5) ------------------------------
+# The binary authenticates with a client certificate minted at first boot
+# (CN=system:metrics). This is the set upstream's Deployment grants its
+# ServiceAccount, minus everything a host service does not need: it reads the node
+# and pod lists to know what to scrape, and the node metrics subresource to publish.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeos:metrics-server
+rules:
+  - apiGroups: [""]
+    resources: ["nodes/metrics"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeos:metrics-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeos:metrics-server
+subjects:
+  - kind: User
+    name: system:metrics
+    apiGroup: rbac.authorization.k8s.io
+---
+# An aggregated API server validates the tokens its callers present (TokenReview)
+# and their permissions (SubjectAccessReview) by asking the core API server. Without
+# this binding every `kubectl top` fails with 401/403 while the process looks healthy.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeos:metrics-server:system:auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: User
+    name: system:metrics
+    apiGroup: rbac.authorization.k8s.io
+---
+# NOTE: there is deliberately NO kube-system ConfigMap read grant here. An aggregated
+# API server normally reads kube-system/extension-apiserver-authentication, and two
+# things were measured on a live node (2026-11-11): (a) a hand-written Role allowing
+# only `get` on it is not enough, because metrics-server's reflector does list+watch;
+# (b) the built-in ClusterRole extension-apiserver-authentication-reader that upstream
+# binds does not exist here, because `kubeadm init` normally creates it and this
+# design never runs `kubeadm init`. Both problems disappear by not reading that
+# ConfigMap at all: kubeos-metrics-server.service passes the same client CA and
+# request-header values as files. Fewer privileges, and no startup race.
+---
+# Who may READ the metrics API. Upstream ships this ClusterRole so that `kubectl top`
+# works for every authenticated user; the aggregation labels make it part of the
+# admin/edit/view roles as well, which is what tools such as the dashboard rely on.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:aggregated-metrics-reader
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeos:metrics-server:system:aggregated-metrics-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:aggregated-metrics-reader
+subjects:
+  - kind: Group
+    name: system:authenticated
+    apiGroup: rbac.authorization.k8s.io
+---
+# No selector, exactly like kube-dns: the EndpointSlice below is the only source of
+# truth, and the cluster IP is pinned because the serving certificate carries it.
+# targetPort 10443 is the unit's --secure-port (10250 belongs to kubelet on the host).
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-server
+  namespace: kube-system
+  labels:
+    k8s-app: metrics-server
+    kubernetes.io/name: Metrics-server
+spec:
+  type: ClusterIP
+  clusterIP: __KUBEOS_METRICS_SERVICE_IP__
+  ports:
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: 10443
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: metrics-server-kubeos
+  namespace: kube-system
+  labels:
+    k8s-app: metrics-server
+    kubernetes.io/service-name: metrics-server
+addressType: IPv4
+ports:
+  - name: https
+    port: 10443
+    protocol: TCP
+endpoints:
+  - addresses:
+      - __KUBEOS_NODE_IP__
+    conditions:
+      ready: true
+---
+# Registered last: creating an APIService whose backend is not listening yet only
+# makes that one group unavailable for a few seconds, which is why first boot applies
+# this before starting the unit and then waits for it to become Available.
+# `caBundle` (not insecureSkipTLSVerify) is the whole point of D5: the API server
+# verifies the host service's certificate against the cluster CA.
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.metrics.k8s.io
+  labels:
+    k8s-app: metrics-server
+spec:
+  group: metrics.k8s.io
+  groupPriorityMinimum: 100
+  version: v1beta1
+  versionPriority: 100
+  caBundle: __KUBEOS_CA_BUNDLE__
+  service:
+    name: metrics-server
+    namespace: kube-system
+    port: 443
+
+---
+# --- local storage provisioner (a host service, not a Pod) --------------------
+# WHY THESE THREE OBJECTS EXIST: dynamic storage with no container image and no
+# helper Pod. Upstream local-path-provisioner creates a helper Pod per volume just to
+# run `mkdir` on the node, which costs a busybox image in an offline ISO and puts
+# Pods on a node designed to keep its services off Pods (measured 2026-11-11; the
+# full reasoning is in /usr/bin/kubeos-storage-provisioner).
+#
+# /usr/bin/kubeos-storage-provisioner watches claims, creates the directory on the
+# pod-data LV and creates a PRE-BOUND PersistentVolume, so the PV controller binds the
+# claim at once. The StorageClass below is therefore the contract, not a provisioner
+# registration: `kubeos.io/local` has no external-provisioner behind it on purpose.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-path
+  labels:
+    kubeos.in/component: local-storage
+  annotations:
+    # KubeOS: a claim that names no class must still bind - that is the common case
+    # (the dashboard, naive manifests, `kubectl create` examples). Upstream ships no
+    # default class at all.
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: kubeos.io/local
+# NOT optional, and the reason is not obvious. Our provisioner only acts on claims
+# the scheduler has already placed, because it reads the node from
+# volume.kubernetes.io/selected-node to build the PV's nodeAffinity. With Immediate
+# no scheduler ever touches the claim, so no PV is ever made and every claim stays
+# Pending - the exact defect that broke all KubeOS dynamic storage for days
+# (AGENTS.md section 14). Also immutable: changing it means delete + recreate.
+volumeBindingMode: WaitForFirstConsumer
+# The PV carries Delete too; Kubernetes has no deleter for hostPath, so the
+# provisioner itself removes the object and the directory when the claim dies.
+reclaimPolicy: Delete
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeos:storage-provisioner
+rules:
+  # Read the claims it must satisfy, and the nodes it stamps into nodeAffinity.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  # Own the volumes it creates. update/patch are needed because it annotates and
+  # labels PVs it created on an earlier boot.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  # So a failed provision is visible on the claim instead of only in the journal.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeos:storage-provisioner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeos:storage-provisioner
+subjects:
+  # CN of /etc/kubernetes/pki/kubeos/storage-provisioner.crt, minted by node-setup.
+  # Never admin.conf: a provisioner that can only touch claims and PVs cannot damage
+  # the node it runs on.
+  - kind: User
+    name: system:storage-provisioner
+    apiGroup: rbac.authorization.k8s.io

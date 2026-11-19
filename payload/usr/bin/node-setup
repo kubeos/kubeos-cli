@@ -1,0 +1,866 @@
+#!/bin/sh
+# KubeOS first boot, part 1: build this node's Kubernetes services.
+#
+# WHEN   Started once by node-setup.service at the first boot of the
+#        *installed* system. Never in the live session: node certificates must be
+#        generated on the machine's own disk, once.
+# WHY    Since 2026-11-11 the control plane is NOT a set of static Pods. This script
+#        generates the PKI with kubeadm's phase commands (which create no manifests),
+#        writes the kubelet/kube-proxy/CNI/DNS configuration, and starts the units in
+#        dependency order, so `kubectl get pods -A` is empty on a fresh node.
+#        docs/NATIVE-CONTROL-PLANE.md is the design; §5 of it is this file's contract.
+# SAFE   Idempotent by construction: the PKI phase is skipped when ca.crt exists, the
+#        kubeconfig phase is skipped per file, `kubectl apply` re-applies the RBAC and
+#        DNS objects, /root/.kube/config is rewritten, and starting an already-running
+#        unit is a no-op. A failure exits non-zero so the unit retries.
+#
+# The pod and service networks are decided HERE, not at build time. KubeOS ships to networks
+# nobody knows in advance, and a pod range that overlaps the machine's own LAN does
+# not fail loudly: packets from pods to the LAN get no route and DNS/NTP/API access
+# silently dies (measured 2026-11-07 with Calico). /etc/kubeos/kubeos.conf defaults
+# to "auto": the first candidate overlapping no local network wins and is logged.
+set -eu
+
+# --prepare-only: do everything that only WRITES files and stop before starting any
+# unit. The installer calls it through d-i's late_command after GRUB is installed, so
+# the per-machine secrets and configuration exist before the machine is first booted
+# and first boot only has to start services (~8 s instead of ~15 s). Everything here
+# is idempotent, so a half-finished prepare is repaired by the first boot.
+# The banner shown at the console while provisioning is still unfinished. It is
+# replaced by /etc/issue.final once node-ready succeeds.
+# It deliberately carries NO duration ("about 15 seconds"): first boot is ~15 s on
+# fast storage and much longer on a slow disk or a slow VM, so a printed number
+# becomes a lie the user can time. It shows the dashboard address instead, which is
+# what the user actually wants to know.
+# Keep the port in sync with the dashboard chart (~/kubeos-dashboard/deploy/
+# values.yaml, service.nodePort) - the URL is https because Headlamp terminates TLS
+# itself with a per-machine certificate.
+DASHBOARD_PORT=30443
+
+PREPARE_ONLY=0
+if [ "${1:-}" = "--prepare-only" ]; then
+    PREPARE_ONLY=1
+fi
+
+CONF=/etc/kubeos/kubeos.conf
+STATE=/etc/kubeos/cluster-network.conf
+ERROR_FILE=/etc/kubeos/last-error
+PKI=/etc/kubernetes/pki
+ADMIN_CONF=/etc/kubernetes/admin.conf
+KUBELET_CONF=/etc/kubernetes/kubelet.conf
+PROXY_CONF=/etc/kubernetes/kube-proxy.conf
+PROXY_CONFIG=/var/lib/kube-proxy/config.conf
+KUBELET_CONFIG=/var/lib/kubelet/config.yaml
+KUBELET_FLAGS=/var/lib/kubelet/kubeadm-flags.env
+FLANNEL_KUBECONFIG=/etc/kubernetes/flannel.conf
+COREDNS_KUBECONFIG=/etc/kubernetes/coredns.conf
+METRICS_KUBECONFIG=/etc/kubernetes/metrics-server.conf
+STORAGE_KUBECONFIG=/etc/kubernetes/storage-provisioner.conf
+COREFILE=/etc/coredns/Corefile
+CNI_CONF=/etc/cni/net.d/10-kubeos.conflist
+NS_SERVICES=/usr/share/kubeos/manifests/native-services.yaml
+SOCK=/run/containerd/containerd.sock
+CLUSTER_DOMAIN=cluster.local
+# The CoreDNS address inside the service range: kubeadm's own convention is the
+# tenth address of the range (.10), and pods get it from the kubelet config.
+DNS_HOST_PART=10
+WAIT=120            # seconds to wait for one component to come up
+PROXY_WAIT=180      # kube-proxy writes iptables rules; give it longer
+
+# Tried in order when the setting is "auto". 10.244.0.0/16 is what k3s, Talos and
+# flannel use, so it is the least likely to collide with a home or office LAN.
+POD_CANDIDATES="10.244.0.0/16 10.245.0.0/16 10.246.0.0/16 10.247.0.0/16 10.248.0.0/16 10.249.0.0/16 10.250.0.0/16 10.251.0.0/16"
+SERVICE_CANDIDATES="10.96.0.0/12 10.112.0.0/12 10.128.0.0/12"
+
+POD_CIDR=auto
+SERVICE_CIDR=auto
+# shellcheck disable=SC1090  # shipped in the image, not present in the source tree
+if [ -r "$CONF" ]; then
+    . "$CONF"
+fi
+
+log() { echo "node-setup: $*"; }
+
+# say_first_boot_running: put the dashboard address in /etc/issue (idempotent).
+# Called once NODE_IP is known; node-ready replaces the file with issue.final later.
+# Deliberately no "setting up …" or "do not power off" narration: the console
+# shows the banner and the address, nothing else (user, 2026-11-11).
+say_first_boot_running() {
+    [ -f /etc/issue ] || return 0
+    if grep -q "Web dashboard" /etc/issue 2>/dev/null; then
+        return 0
+    fi
+    # No hostname in the header: in --prepare-only mode the kernel still reports the
+    # live session's name, and node-ready replaces this file once the
+    # node is up anyway.
+    printf '%s\n\n%s\n\n' "KubeOS Linux 0.1.0 alpha (Orhan)" \
+"Web dashboard:  https://${NODE_IP}:${DASHBOARD_PORT}
+(self-signed certificate: accept the browser warning once)" > /etc/issue
+}
+
+# --- IPv4 arithmetic (no ipcalc, no python3 on a slim image) ----------------
+ip_to_int() {
+    IFS=. read -r a b c d <<EOF
+$1
+EOF
+    printf '%s\n' $(( (a << 24) + (b << 16) + (c << 8) + d ))
+}
+
+int_to_ip() {
+    printf '%s.%s.%s.%s\n' \
+        $(( ($1 >> 24) & 255 )) $(( ($1 >> 16) & 255 )) \
+        $(( ($1 >> 8) & 255 )) $(( $1 & 255 ))
+}
+
+cidr_bounds() {
+    _base=$(ip_to_int "${1%/*}")
+    _hostmask=$(( (1 << (32 - ${1#*/})) - 1 ))
+    _net=$(( _base & (0xFFFFFFFF - _hostmask) ))
+    printf '%s %s\n' "$_net" "$(( _net | _hostmask ))"
+}
+
+cidrs_overlap() {
+    # shellcheck disable=SC2046  # deliberate: split into network/broadcast
+    set -- $(cidr_bounds "$1") $(cidr_bounds "$2")
+    [ "$1" -le "$4" ] && [ "$3" -le "$2" ]
+}
+
+valid_cidr() {
+    case "$1" in
+        */*) ;;
+        *) return 1 ;;
+    esac
+    (
+        set -e
+        _base=$(ip_to_int "${1%/*}")
+        _pfx=${1#*/}
+        [ "$_pfx" -ge 0 ] && [ "$_pfx" -le 32 ]
+        [ "$_base" -ge 0 ] && [ "$_base" -le 4294967295 ]
+    ) >/dev/null 2>&1
+}
+
+local_networks() {
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}'
+    ip -4 route show scope link 2>/dev/null | awk '$1 ~ /^[0-9.]+(\/[0-9]+)$/ {print $1}'
+}
+
+overlapping_local_network() {
+    for _l in $(local_networks); do
+        if cidrs_overlap "$1" "$_l"; then
+            printf '%s\n' "$_l"
+            return 0
+        fi
+    done
+    return 1
+}
+
+die() {
+    log "ERROR: $1"
+    install -d -m 0755 /etc/kubeos
+    printf '%s\n' "$1" > "$ERROR_FILE"
+    exit 1
+}
+
+# node_ip: the address this node talks to the rest of the world from. Same value the
+# kubelet will advertise and that etcd/flannel/CoreDNS bind to, so it is decided once.
+node_ip() {
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}'
+}
+
+# --- pod and service networks -------------------------------------------------------
+resolve_cidrs() {
+    if [ "$POD_CIDR" != auto ] && ! valid_cidr "$POD_CIDR"; then
+        die "POD_CIDR='$POD_CIDR' in $CONF is not an IPv4 CIDR (expected something like 10.244.0.0/16)"
+    fi
+    if [ "$SERVICE_CIDR" != auto ] && ! valid_cidr "$SERVICE_CIDR"; then
+        die "SERVICE_CIDR='$SERVICE_CIDR' in $CONF is not an IPv4 CIDR (expected something like 10.96.0.0/12)"
+    fi
+
+    if [ "$POD_CIDR" = auto ]; then
+        _chosen=""
+        for _c in $POD_CANDIDATES; do
+            if ! overlapping_local_network "$_c" >/dev/null; then
+                _chosen=$_c
+                break
+            fi
+        done
+        [ -n "$_chosen" ] || die "every candidate pod network ($POD_CANDIDATES) overlaps a network on this machine; set POD_CIDR in $CONF"
+        POD_CIDR=$_chosen
+        log "pod network $POD_CIDR (chosen automatically; pin it with POD_CIDR in $CONF)"
+    else
+        if _conflict=$(overlapping_local_network "$POD_CIDR"); then
+            die "POD_CIDR=$POD_CIDR overlaps this machine's network $_conflict, so pods could not reach the LAN. Set POD_CIDR in $CONF to a free range, then: systemctl restart node-setup"
+        fi
+        log "pod network $POD_CIDR (set in $CONF)"
+    fi
+
+    if [ "$SERVICE_CIDR" = auto ]; then
+        _chosen=""
+        for _c in $SERVICE_CANDIDATES; do
+            if ! overlapping_local_network "$_c" >/dev/null && ! cidrs_overlap "$_c" "$POD_CIDR"; then
+                _chosen=$_c
+                break
+            fi
+        done
+        [ -n "$_chosen" ] || die "no usable service range left on this machine; set SERVICE_CIDR in $CONF"
+        SERVICE_CIDR=$_chosen
+        log "service network $SERVICE_CIDR (chosen automatically; pin it with SERVICE_CIDR in $CONF)"
+    else
+        if _conflict=$(overlapping_local_network "$SERVICE_CIDR"); then
+            die "SERVICE_CIDR=$SERVICE_CIDR overlaps this machine's network $_conflict; set SERVICE_CIDR in $CONF to a free range"
+        fi
+        if cidrs_overlap "$SERVICE_CIDR" "$POD_CIDR"; then
+            die "SERVICE_CIDR=$SERVICE_CIDR overlaps POD_CIDR=$POD_CIDR; they must be two separate ranges"
+        fi
+        log "service network $SERVICE_CIDR (set in $CONF)"
+    fi
+}
+
+# write_state: the one file every unit reads. Rewritten on every run so a changed
+# node address (new LAN, new DHCP lease) does not leave the units talking to the old
+# one. POD_CIDR/SERVICE_CIDR never change for an existing node.
+write_state() {
+    install -d -m 0755 /etc/kubeos
+    {
+        echo "# Written by node-setup at first boot: the addresses this"
+        echo "# node was built with. Read by etcd/kube-apiserver/"
+        echo "# kube-controller-manager/flanneld through EnvironmentFile=."
+        echo "POD_CIDR=$POD_CIDR"
+        echo "SERVICE_CIDR=$SERVICE_CIDR"
+        echo "NODE_IP=$NODE_IP"
+        echo "DNS_SERVICE_IP=$DNS_SERVICE_IP"
+    } > "$STATE"
+    rm -f "$ERROR_FILE"
+}
+
+# The installer captures this run's output into /var/log/kubeos-prepare.log of the new
+# system, so this first line is what proves the prepare was attempted at all.
+if [ "$PREPARE_ONLY" -eq 1 ]; then
+    log "prepare-only: writing the PKI, the kubeconfigs and the service configuration"
+fi
+
+# --- prerequisites (unchanged from the kubeadm era) -------------------------
+if grep -qE '^[^#].*[[:space:]]swap[[:space:]]' /etc/fstab 2>/dev/null; then
+    log "disabling swap entries in /etc/fstab (Kubernetes requirement)"
+    sed -i -E 's|^([^#].*[[:space:]]swap[[:space:]].*)$|# disabled by KubeOS: \1|' /etc/fstab
+fi
+
+# The rest of this section talks to a RUNNING machine: swap, kernel modules and the
+# container runtime. In --prepare-only mode there is none - the installer's chroot has
+# no containerd and cannot load modules - so it is deferred to the first boot, which
+# does it anyway. Measured 2026-11-11: without this guard the prepare sat in the
+# containerd wait below for its whole 60 s and then died, so nothing at all was
+# prepared and the installation gained a minute of nothing.
+if [ "$PREPARE_ONLY" -eq 0 ]; then
+    swapoff -a || log "swapoff: nothing to disable"
+    modprobe overlay || log "WARNING: overlay module could not be loaded"
+    modprobe br_netfilter || log "WARNING: br_netfilter module could not be loaded"
+    sysctl --system >/dev/null 2>&1 || log "WARNING: sysctl --system failed"
+fi
+
+# /etc/hostname, not `hostname`: this script also runs chrooted from the installer
+# (--prepare-only), where the kernel hostname still belongs to the live session while
+# /etc/hostname already holds the name this machine will have after the reboot.
+# nodeRegistration.name and every certificate SAN is derived from it, so getting this
+# wrong would poison the whole PKI.
+THIS_HOST="$(head -n 1 /etc/hostname 2>/dev/null)"
+[ -n "$THIS_HOST" ] || THIS_HOST="$(hostname)"
+if grep -qE '^127\.0\.1\.1' /etc/hosts; then
+    sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${THIS_HOST}/" /etc/hosts
+else
+    printf '127.0.1.1\t%s\n' "$THIS_HOST" >> /etc/hosts
+fi
+
+# Not in --prepare-only mode: this socket belongs to a running machine (see above),
+# and waiting for it inside the installer is what aborted the prepare on 2026-11-11.
+if [ "$PREPARE_ONLY" -eq 0 ]; then
+    i=0
+    while [ ! -S "$SOCK" ]; do
+        i=$((i + 1))
+        [ "$i" -lt 60 ] || die "containerd socket $SOCK did not appear within 60 s"
+        sleep 1
+    done
+fi
+
+# --- addresses -------------------------------------------------------------
+NODE_IP="$(node_ip || true)"
+[ -n "$NODE_IP" ] || die "could not determine this node's IP (no default route?); a KubeOS node needs a network connection"
+log "node address $NODE_IP"
+
+# Tell the console what is happening before the slow part starts. Moved below the
+# address discovery because the notice prints the dashboard URL; on a re-run the
+# /etc/issue guard makes it a no-op.
+say_first_boot_running
+
+if [ -f "$ADMIN_CONF" ] && [ -f "$STATE" ]; then
+    # shellcheck disable=SC1090  # written by this script in an earlier run
+    . "$STATE"
+    log "node already set up with pod network $POD_CIDR, service network $SERVICE_CIDR"
+    # NODE_IP may legitimately have changed; the state file was just rewritten.
+    NODE_IP="$(node_ip || true)"
+else
+    resolve_cidrs
+fi
+
+SERVICE_BASE=""
+# The DNS address: tenth host of the service range (kubeadm convention).
+# shellcheck disable=SC2046  # deliberate: network/broadcast split
+set -- $(cidr_bounds "$SERVICE_CIDR")
+SERVICE_BASE=$1
+DNS_SERVICE_IP="$(int_to_ip $(( SERVICE_BASE + DNS_HOST_PART )))"
+log "DNS service will be $DNS_SERVICE_IP ($CLUSTER_DOMAIN)"
+
+# The metrics API's ClusterIP, pinned like kube-dns's because both Services are
+# selector-less and their endpoints are hand-made. It is the 11th address, clear of
+# 10.96.0.1 (kubernetes.default) and of the DNS address above - and the serving
+# certificate must carry it, because the API server dials the ClusterIP and therefore
+# verifies the certificate against an IP, not a name.
+METRICS_SERVICE_IP="$(int_to_ip $(( SERVICE_BASE + DNS_HOST_PART + 1 )))"
+log "metrics API will answer on $METRICS_SERVICE_IP"
+write_state
+
+# --- PKI and kubeconfigs (kubeadm phases only: they create no Pod manifests) --
+install -d -m 0700 "$PKI"
+if [ -f "$PKI/ca.crt" ]; then
+    log "certificates already present, skipping the certs phase"
+else
+    # No --cri-socket here: the cert/key/kubeconfig phases talk to no runtime and
+    # kubeadm rejects the flag on them (measured on an installed node, 2026-11-11).
+    log "generating the node PKI (kubeadm init phase certs all)"
+    if ! kubeadm init phase certs all; then
+        die "kubeadm init phase certs all failed; see journalctl -u node-setup -b"
+    fi
+fi
+
+if [ -f "$ADMIN_CONF" ] && [ -f "$KUBELET_CONF" ] && [ -f "$PROXY_CONF" ]; then
+    log "kubeconfigs already present, skipping the kubeconfig phases"
+else
+    log "generating admin/kubelet/controller-manager/scheduler kubeconfigs"
+    kubeadm init phase kubeconfig all || die "kubeadm init phase kubeconfig all failed"
+    # The kube-proxy kubeconfig is NOT one of the `phase kubeconfig` subcommands
+    # (admin, kubelet, controller-manager, scheduler, user, all - measured on an
+    # installed node, 2026-11-11: "unknown command kube-proxy"). kubeadm creates it
+    # inside its kube-proxy addon, which needs a running API server and would create the
+    # DaemonSet we are removing. `kubeadm kubeconfig user` writes exactly the same
+    # identity - CN system:kube-proxy, group system:node-proxier - signed by this
+    # node's CA, and needs no running API server.
+    log "generating the kube-proxy kubeconfig"
+    kubeadm kubeconfig user \
+        --client-name=system:kube-proxy \
+        --org=system:node-proxier > "$PROXY_CONF" \
+        || die "could not generate the kube-proxy kubeconfig"
+fi
+
+# --- does this PKI belong to this machine? -----------------------------------
+# Cheap insurance against the one dangerous failure of a chrooted prepare: certs
+# generated while the kernel hostname or the network was still the installer's. The
+# files would exist, so every "already present" check would happily skip them, and
+# the node would come up with the wrong name and without its own IP in the SANs.
+pki_is_ours() {
+    [ -f "$PKI/apiserver.crt" ] || return 1
+    openssl x509 -in "$PKI/apiserver.crt" -noout -text 2>/dev/null \
+        | grep -q "IP Address:$NODE_IP" || return 1
+    if [ -f "$KUBELET_CONF" ]; then
+        grep -q "system:node:$THIS_HOST" "$KUBELET_CONF" || return 1
+    fi
+    return 0
+}
+if [ -f "$PKI/ca.crt" ] && ! pki_is_ours; then
+    log "WARNING: the existing certificates do not belong to this machine ($THIS_HOST/$NODE_IP); regenerating them"
+    rm -rf "$PKI" "$ADMIN_CONF" "$KUBELET_CONF" "$PROXY_CONF" \
+           /etc/kubernetes/controller-manager.conf /etc/kubernetes/scheduler.conf \
+           /etc/kubernetes/super-admin.conf
+    install -d -m 0700 "$PKI"
+    if ! kubeadm init phase certs all; then
+        die "certificate regeneration failed"
+    fi
+    kubeadm init phase kubeconfig all || die "kubeconfig regeneration failed"
+    kubeadm kubeconfig user --client-name=system:kube-proxy \
+        --org=system:node-proxier > "$PROXY_CONF" \
+        || die "could not regenerate the kube-proxy kubeconfig"
+fi
+
+# --- client identities for the two host services ----------------------------
+# flanneld and CoreDNS need to talk to the API. They get their own certificates,
+# signed by this node's CA, with a CN that the RBAC manifest binds to a narrow
+# ClusterRole - never admin.conf, which is cluster-admin.
+install -d -m 0755 /etc/kubernetes/pki/kubeos
+mint_client_cert() {
+    _name="$1"
+    command -v openssl >/dev/null 2>&1 || die "openssl is missing; it signs the flannel/CoreDNS client certificates"
+    _crt="$PKI/kubeos/${_name}.crt"
+    _key="$PKI/kubeos/${_name}.key"
+    if [ -f "$_crt" ] && [ -f "$_key" ]; then
+        return 0
+    fi
+    log "minting a client certificate for system:${_name}"
+    openssl req -new -newkey rsa:2048 -nodes -keyout "$_key" \
+        -subj "/CN=system:${_name}" -out "/tmp/${_name}.csr" >/dev/null 2>&1 \
+        || die "could not create a key for system:${_name}"
+    openssl x509 -req -in "/tmp/${_name}.csr" -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" \
+        -CAcreateserial -days 3650 -sha256 -out "$_crt" >/dev/null 2>&1 \
+        || die "could not sign a certificate for system:${_name}"
+    rm -f "/tmp/${_name}.csr"
+    chmod 0600 "$_key"
+}
+
+# mint_server_cert NAME SAN-LIST: a SERVING certificate for a host service that the
+# API server itself has to verify (an aggregated API). Same node CA as the client
+# certificates, but with serverAuth usage and the SANs the caller will check - which
+# for an APIService means the ClusterIP, because the API server dials the Service.
+mint_server_cert() {
+    _name="$1"
+    _sans="$2"
+    command -v openssl >/dev/null 2>&1 || die "openssl is missing; it signs the ${_name} serving certificate"
+    _crt="$PKI/kubeos/${_name}.crt"
+    _key="$PKI/kubeos/${_name}.key"
+    if [ -f "$_crt" ] && [ -f "$_key" ]; then
+        return 0
+    fi
+    log "minting a serving certificate for ${_name} (SAN ${_sans})"
+    openssl req -new -newkey rsa:2048 -nodes -keyout "$_key" \
+        -subj "/CN=${_name}.kube-system.svc" -out "/tmp/${_name}.csr" >/dev/null 2>&1 \
+        || die "could not create a key for the ${_name} serving certificate"
+    printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature,keyEncipherment\n' \
+        "$_sans" > "/tmp/${_name}.ext" \
+        || die "could not write the ${_name} certificate extensions"
+    openssl x509 -req -in "/tmp/${_name}.csr" -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" \
+        -CAcreateserial -days 3650 -sha256 -extfile "/tmp/${_name}.ext" \
+        -out "$_crt" >/dev/null 2>&1 \
+        || die "could not sign the ${_name} serving certificate"
+    rm -f "/tmp/${_name}.csr" "/tmp/${_name}.ext"
+    chmod 0600 "$_key"
+    chmod 0644 "$_crt"
+}
+
+# write_client_kubeconfig DEST USER: a kubeconfig for one host service
+# (client certificate pinned in the kubeconfig's cluster entry, so no token is needed).
+write_client_kubeconfig() {
+    _dest="$1"
+    _user="$2"
+    cat > "$_dest" <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+  - name: kubeos
+    cluster:
+      certificate-authority: $PKI/ca.crt
+      server: https://${NODE_IP}:6443
+users:
+  - name: ${_user}
+    user:
+      client-certificate: $PKI/kubeos/${_user}.crt
+      client-key: $PKI/kubeos/${_user}.key
+contexts:
+  - name: ${_user}@kubeos
+    context:
+      cluster: kubeos
+      user: ${_user}
+current-context: ${_user}@kubeos
+EOF
+    chmod 0600 "$_dest"
+}
+
+mint_client_cert flannel
+mint_client_cert coredns
+write_client_kubeconfig "$FLANNEL_KUBECONFIG" flannel
+write_client_kubeconfig "$COREDNS_KUBECONFIG" coredns
+
+# --- metrics-server: a client identity AND a serving certificate (D5) --------
+# The binary is both a client (it lists nodes/pods and is validated with the
+# TokenReview API) and an aggregated API server (the API server, kube-proxy and
+# kubectl talk TLS to IT). Hence two certificates for one service: system:metrics
+# proves who it is to the API, and the serving certificate proves to the API server
+# that the process on the ClusterIP is really ours.
+mint_client_cert metrics
+write_client_kubeconfig "$METRICS_KUBECONFIG" metrics
+mint_server_cert metrics-server \
+    "DNS:metrics-server.kube-system.svc,DNS:metrics-server.kube-system.svc.cluster.local,IP:${NODE_IP},IP:127.0.0.1,IP:${METRICS_SERVICE_IP}"
+
+# --- local storage provisioner: a client identity only ------------------------
+# It watches PersistentVolumeClaims, creates PersistentVolumes and reads Nodes - and
+# nothing else, which is why it gets its own CN and a narrow ClusterRole in
+# native-services.yaml rather than admin.conf. No serving certificate: it never
+# receives a connection, it only calls the API.
+mint_client_cert storage-provisioner
+write_client_kubeconfig "$STORAGE_KUBECONFIG" storage-provisioner
+
+# --- kubelet configuration -------------------------------------------------
+# No staticPodPath key anywhere: that is what kept kubeadm's own control plane
+# alive, and its absence is what makes `kubectl get pods -A` empty. The Debian
+# kubelet drop-in already passes --config=/var/lib/kubelet/config.yaml and
+# --kubeconfig=/etc/kubernetes/kubelet.conf, so no drop-in of our own is needed.
+install -d -m 0750 /var/lib/kubelet /var/lib/kube-proxy
+cat > "$KUBELET_CONFIG" <<EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+authentication:
+  anonymous:
+    enabled: false
+  webhook:
+    enabled: true
+  x509:
+    clientCAFile: $PKI/ca.crt
+authorization:
+  mode: Webhook
+clusterDomain: $CLUSTER_DOMAIN
+clusterDNS:
+  - $DNS_SERVICE_IP
+resolvConf: /etc/resolv.conf
+cgroupDriver: systemd
+rotateCertificates: true
+serverTLSBootstrap: false
+failSwapOn: true
+EOF
+grep -q staticPodPath "$KUBELET_CONFIG" && die "$KUBELET_CONFIG must not contain staticPodPath"
+
+# Runtime flags kubeadm would have put here. The drop-in sources this file (it is its
+# EnvironmentFile), which is exactly the slot for machine-specific arguments.
+cat > "$KUBELET_FLAGS" <<EOF
+KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix://$SOCK --node-ip=$NODE_IP --hostname-override=$THIS_HOST"
+EOF
+
+# --- kube-proxy configuration ----------------------------------------------
+cat > "$PROXY_CONFIG" <<EOF
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+bindAddress: 0.0.0.0
+clientConnection:
+  kubeconfig: $PROXY_CONF
+clusterCIDR: $POD_CIDR
+hostnameOverride: $THIS_HOST
+mode: iptables
+conntrack:
+  maxPerCore: 0
+  tcpEstablishedTimeout: 24h0m0s
+  tcpCloseWaitTimeout: 1h0m0s
+iptables:
+  masqueradeAll: false
+EOF
+
+# --- stop here when the installer asked for preparation only ----------------
+if [ "$PREPARE_ONLY" -eq 1 ]; then
+    log "prepare-only: certificates, kubeconfigs and service configuration are on disk"
+    log "prepare-only: the Kubernetes services come up at the first boot of the installed system"
+    exit 0
+fi
+
+# --- start the control plane, in dependency order --------------------------
+# etcd is Type=notify, so `systemctl start` returns once it is listening; the
+# apiserver then has a store to talk to instead of racing it.
+start_unit() {
+    _unit="$1"
+    _ready="$2"
+    _timeout="${3:-$WAIT}"
+    if ! systemctl enable "$_unit" >/dev/null 2>&1; then
+        log "WARNING: could not enable $_unit"
+    fi
+    if ! systemctl start "$_unit"; then
+        log "ERROR: $_unit failed to start:"
+        systemctl --no-pager --lines=15 status "$_unit" || true
+        exit 1
+    fi
+    _i=0
+    while : ; do
+        if sh -c "$_ready"; then
+            log "$_unit is up"
+            return 0
+        fi
+        _i=$((_i + 1))
+        if [ "$_i" -ge "$_timeout" ]; then
+            log "ERROR: $_unit did not become ready within ${_timeout}s"
+            systemctl --no-pager --lines=15 status "$_unit" || true
+            exit 1
+        fi
+        sleep 2
+    done
+}
+
+start_unit etcd.service 'systemctl is-active --quiet etcd.service'
+# admin.conf is a kubeconfig for root right now; it is copied to /root/.kube/config
+# below. Using it here means the readiness probes need no curl on the node.
+KUBECONFIG="$ADMIN_CONF"
+export KUBECONFIG
+start_unit kube-apiserver.service 'kubectl get --raw /readyz >/dev/null 2>&1'
+start_unit kube-controller-manager.service 'systemctl is-active --quiet kube-controller-manager.service'
+start_unit kube-scheduler.service 'systemctl is-active --quiet kube-scheduler.service'
+
+# --- root's kubeconfig, then the identities the host services need ----------
+install -d -m 0755 /root/.kube
+install -m 0600 "$ADMIN_CONF" /root/.kube/config
+export KUBECONFIG="$ADMIN_CONF"
+log "kubeconfig ready: /root/.kube/config"
+
+# --- the API objects the host services authenticate against -----------------
+# Rendered in place: the manifest carries placeholders because the node address and
+# the service-range DNS IP are only known here.
+RENDERED=/run/kubeos/native-services.yaml
+install -d -m 0755 /run/kubeos
+# The CA bundle is base64 of the node CA (single line), which is exactly what
+# APIService.spec.caBundle wants. `|` as the sed delimiter because base64 contains
+# `/`, and base64 contains neither `&` nor `\`, which sed would treat specially.
+CA_BUNDLE="$(base64 -w0 "$PKI/ca.crt")" || die "could not base64-encode $PKI/ca.crt"
+sed -e "s|__KUBEOS_DNS_SERVICE_IP__|$DNS_SERVICE_IP|g" \
+    -e "s|__KUBEOS_METRICS_SERVICE_IP__|$METRICS_SERVICE_IP|g" \
+    -e "s|__KUBEOS_NODE_IP__|$NODE_IP|g" \
+    -e "s|__KUBEOS_CA_BUNDLE__|$CA_BUNDLE|g" "$NS_SERVICES" > "$RENDERED" \
+    || die "could not render $NS_SERVICES"
+if grep -q '__KUBEOS_' "$RENDERED"; then
+    die "unsubstituted placeholders remain in $RENDERED: $(grep -o '__KUBEOS_[A-Z_]*__' "$RENDERED" | sort -u | tr '\n' ' ')"
+fi
+# This apply has to happen as kubeadm's break-glass identity: admin.conf carries
+# O=kubeadm:cluster-admins, whose cluster-admin binding does not exist yet (kubeadm
+# init would have created it), so kubernetes-admin is Forbidden until this very
+# manifest grants it. super-admin.conf is system:masters and bypasses RBAC by
+# design, which is exactly what it is for.
+BREAKGLASS=/etc/kubernetes/super-admin.conf
+if [ -f "$BREAKGLASS" ]; then
+    if ! kubectl --kubeconfig="$BREAKGLASS" apply -f "$RENDERED"; then
+        die "could not apply $NS_SERVICES as the break-glass identity"
+    fi
+else
+    if ! kubectl apply -f "$RENDERED"; then
+        die "could not apply $NS_SERVICES (RBAC + kube-dns); the host services cannot authenticate without it"
+    fi
+fi
+KUBECONFIG="$ADMIN_CONF"
+export KUBECONFIG
+
+# --- make this cluster JOINABLE ----------------------------------------------------
+# WHY: a second node cannot join a cluster whose bootstrap RBAC was never created.
+# KubeOS builds its PKI with individual `kubeadm init phase` calls instead of
+# `kubeadm init`, and the bootstrap-token phase is the one thing `kubeadm init` would
+# have done that nothing here did - so on a real second node (kubeos2, 192.168.122.6,
+# 2026-11-12) `kubeadm join` failed three times in a row:
+#   1. kube-system/kubeadm-config did not exist AND nothing let a bootstrap token read it,
+#   2. then kube-system/kubelet-config, for the same reason,
+#   3. and without the RBAC below the token's very first CSR would have been Forbidden.
+# Everything here is created with `apply`/idempotent phases, so re-running node-setup is
+# harmless, and a cluster that is never joined pays only a few API writes.
+log "making the cluster joinable: bootstrap tokens and the kubeadm config objects"
+if ! kubeadm init phase bootstrap-token >/dev/null 2>&1; then
+    log "WARNING: 'kubeadm init phase bootstrap-token' failed; other nodes may not be able to join"
+fi
+
+# A joining node reads its ClusterConfiguration from this ConfigMap. controlPlaneEndpoint
+# is what makes the join command point at THIS machine rather than at whatever address the
+# joining node happens to guess.
+CC_FILE=/etc/kubernetes/kubeadm-cluster-config.yaml
+K8S_VERSION="$(kubelet --version 2>/dev/null | awk '{print $2}' | sed 's/^v//')"
+[ -n "$K8S_VERSION" ] || K8S_VERSION="$(kubeadm version -o short | sed 's/^v//')"
+cat > "$CC_FILE" <<CC
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+clusterName: kubernetes
+kubernetesVersion: v$K8S_VERSION
+controlPlaneEndpoint: "$NODE_IP:6443"
+networking:
+  dnsDomain: cluster.local
+  podSubnet: $POD_CIDR
+  serviceSubnet: $SERVICE_CIDR
+CC
+chmod 0600 "$CC_FILE"
+kubectl create configmap kubeadm-config -n kube-system \
+    --from-file=ClusterConfiguration="$CC_FILE" --dry-run=client -o yaml |
+    kubectl apply -f - >/dev/null ||
+    log "WARNING: could not publish kube-system/kubeadm-config; other nodes will not join"
+
+# The kubelet configuration THIS node runs, so a joining node inherits the same one instead
+# of kubeadm's defaults (which disagree about cgroups, the resolv.conf and the CRI socket).
+kubectl create configmap kubelet-config -n kube-system \
+    --from-file=kubelet=/var/lib/kubelet/config.yaml --dry-run=client -o yaml |
+    kubectl apply -f - >/dev/null ||
+    log "WARNING: could not publish kube-system/kubelet-config; other nodes will not join"
+
+# A bootstrap token may read exactly those ConfigMaps and nothing else.
+JOIN_RBAC=/tmp/kubeos-join-rbac.yaml
+cat > "$JOIN_RBAC" <<RBAC
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubeos:bootstrap-config-reader
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["kubeadm-config", "kubelet-config", "kube-proxy"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubeos:bootstrap-config-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeos:bootstrap-config-reader
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: system:bootstrappers:kubeadm:default-node-token
+RBAC
+if ! kubectl apply -f "$JOIN_RBAC" >/dev/null; then
+    log "WARNING: could not grant bootstrap tokens read access to the kubeadm config"
+fi
+rm -f "$JOIN_RBAC"
+log "join command for another node: kubeadm token create --print-join-command"
+
+# --- the Node object first: flannel cannot allocate a subnet without it -------
+# kubelet registers the node (as NotReady, there is no CNI yet); the
+# controller-manager then stamps node.spec.podCIDR; only then can flanneld read its
+# slice. Starting flanneld before this point makes it retry against an empty API.
+install -d -m 0755 /etc/cni/net.d /opt/cni/bin /run/flannel
+start_unit kubelet.service 'kubectl get nodes --no-headers 2>/dev/null | grep -q .'
+log "node $THIS_HOST registered with the API"
+
+# --- CNI: bridge + host-local on this node's own podCIDR ----------------------
+# NOT flannel: flanneld's kube subnet manager reads its OWN Pod spec to learn which
+# node it runs on, so it can only work as a DaemonSet - measured on an installed
+# node (2026-11-11): with POD_NAME/POD_NAMESPACE set and the RBAC granted it fails
+# with `pods "kubeos-flanneld" not found`, and inventing a Pod to satisfy that would
+# put a Pod in `kubectl get pods -A`, which is the thing this design removes.
+# On a single node no overlay is needed at all: every pod is on this machine, so a
+# bridge plus host-local IPAM on the podCIDR the controller-manager just assigned is
+# a complete CNI. The trade-off is explicit: adding a second node later needs a
+# distributed CNI, and that one does have to be a DaemonSet.
+# A WAIT, not a check: the controller-manager stamps node.spec.podCIDR a moment
+# after the node registers. Dying here on a fresh install cost a whole 60 s
+# RestartSec for a gap that closes in about two seconds (measured 2026-11-11: the
+# first attempt gave up at 11:30:01 and the retry finished at 11:31:06).
+NODE_POD_CIDR=""
+_i=0
+while : ; do
+    NODE_POD_CIDR="$(kubectl get node "$THIS_HOST" -o jsonpath='{.spec.podCIDR}' 2>/dev/null || true)"
+    if [ -n "$NODE_POD_CIDR" ]; then
+        break
+    fi
+    _i=$((_i + 1))
+    [ "$_i" -lt 30 ] || die "the controller-manager has not assigned a podCIDR to $THIS_HOST within 60 s"
+    sleep 2
+done
+log "CNI subnet for this node: $NODE_POD_CIDR"
+install -d -m 0755 /etc/cni/net.d /opt/cni/bin
+cat > "$CNI_CONF" <<EOF
+{
+  "cniVersion": "1.0.0",
+  "name": "kubeos",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "cni0",
+      "isGateway": true,
+      "ipMasq": true,
+      "hairpinMode": true,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [ [ { "subnet": "$NODE_POD_CIDR" } ] ],
+        "routes": [ { "dst": "0.0.0.0/0" } ]
+      }
+    },
+    {
+      "type": "portmap",
+      "capabilities": { "portMappings": true }
+    },
+    {
+      "type": "loopback"
+    }
+  ]
+}
+EOF
+log "CNI configuration written: $CNI_CONF"
+
+# --- the two services that consume the API as clients -----------------------
+# kube-proxy programs the ClusterIP rules pods need; CoreDNS answers on the node
+# address that the kube-dns EndpointSlice points at.
+# --- DNS: the endpoint pods resolve through, and the Corefile --------
+# `bind` keeps port 53 off 0.0.0.0, where it would fight whatever resolver the
+# machine already runs; pods reach it through the kube-dns ClusterIP instead.
+install -d -m 0755 /etc/coredns
+cat > "$COREFILE" <<EOF
+.:53 {
+    bind $NODE_IP
+    errors
+    health {
+        lameduck 5s
+    }
+    ready
+    kubernetes $CLUSTER_DOMAIN in-addr.arpa ip6.arpa {
+        kubeconfig $COREDNS_KUBECONFIG
+        pods insecure
+        fallthrough in-addr.arpa ip6.arpa
+        ttl 30
+    }
+    forward . /etc/resolv.conf {
+        max_concurrent 1000
+    }
+    cache 30
+    loop
+    reload
+    loadbalance
+}
+EOF
+
+start_unit kube-proxy.service 'systemctl is-active --quiet kube-proxy.service' "$PROXY_WAIT"
+start_unit kubeos-coredns.service 'systemctl is-active --quiet kubeos-coredns.service'
+
+# The node must be Ready before this script reports success: that is the proof the
+# CNI works, and everything the user does next assumes it.
+_i=0
+while : ; do
+    if kubectl get nodes --no-headers 2>/dev/null | grep -qw Ready; then
+        log "node is Ready"
+        break
+    fi
+    _i=$((_i + 1))
+    [ "$_i" -lt 60 ] || die "the node did not become Ready within 120 s (check: journalctl -u kubelet -b)"
+    sleep 2
+done
+
+# --- the metrics API last, and BEST EFFORT ----------------------------------
+# Started after the node is Ready because the metrics API has nothing to publish
+# before that, and its APIService is already registered: the API server retries the
+# backend on its own, so a few seconds of "no metrics yet" is expected and harmless.
+# Deliberately NOT fatal: `kubectl top` is a convenience, and a metrics defect must
+# never stop the node from finishing first boot - the marker would never be written
+# and node-setup would retry for ever (the old Pod-based step 6 followed
+# the same rule). node-ready reports the same condition as a warning.
+if ! systemctl enable kubeos-metrics-server.service >/dev/null 2>&1; then
+    log "WARNING: could not enable kubeos-metrics-server.service"
+fi
+if ! systemctl start kubeos-metrics-server.service; then
+    log "WARNING: kubeos-metrics-server.service failed to start; 'kubectl top' will be unavailable"
+    systemctl --no-pager --lines=10 status kubeos-metrics-server.service || true
+else
+    _i=0
+    while : ; do
+        if kubectl get --raw /apis/metrics.k8s.io/v1beta1 >/dev/null 2>&1; then
+            log "metrics API answers through its APIService"
+            break
+        fi
+        _i=$((_i + 1))
+        if [ "$_i" -ge 30 ]; then
+            log "WARNING: the metrics API did not answer within 60 s; 'kubectl top' may be unavailable"
+            log "WARNING: check: systemctl status kubeos-metrics-server; kubectl get apiservice v1beta1.metrics.k8s.io -o yaml"
+            break
+        fi
+        sleep 2
+    done
+fi
+
+# --- local storage provisioner (see kubeos-storage-provisioner.service) --------
+# Started here, not only at boot, because this is the moment its kubeconfig exists:
+# the unit has ConditionPathExists on it, so a boot-time start would be skipped and
+# "condition failed" is not something systemd retries. Warn-only for the same reason
+# metrics-server is: a storage defect must not stop first boot from finishing (the
+# marker would never be written and this unit would retry for ever). A node with no
+# dynamic storage still runs containers; it just cannot bind a PVC.
+if ! systemctl enable kubeos-storage-provisioner.service >/dev/null 2>&1; then
+    log "WARNING: could not enable kubeos-storage-provisioner.service"
+fi
+if ! systemctl start kubeos-storage-provisioner.service; then
+    log "WARNING: kubeos-storage-provisioner.service failed to start; PVCs will stay Pending"
+    systemctl --no-pager --lines=10 status kubeos-storage-provisioner.service || true
+fi
+
+log "node services are running; handing over to node-ready"

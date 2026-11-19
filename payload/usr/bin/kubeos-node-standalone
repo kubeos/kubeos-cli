@@ -1,0 +1,191 @@
+#!/bin/sh
+# WHEN   started as a transient systemd unit (`kubeos-node-standalone`, via
+#        `POST /action/standalone` on kubeos-console.service) after this machine has been
+#        REMOVED from the cluster it was a worker of - the dashboard gateway fires it once the
+#        API has answered "nodes "<this name>" not found" for --standalone-after seconds.
+#
+# WHY    user decision 2026-11-12 (option A): removing a node must not leave a machine without a
+#        dashboard. A KubeOS node is always a node - either a member of a cluster, or a standalone
+#        one-node cluster - so a removed worker goes back to being what a freshly installed node
+#        is: its own control plane, its own dashboard showing itself, and the Join Cluster page to
+#        attach it somewhere again. Without this the machine kept a kubelet that looped forever on
+#        "node not found" and a dashboard pointing at a cluster that had forgotten it.
+#
+# SAFE   Refuses to do anything when it should not:
+#          * this machine is still a member of the cluster its dashboard points at, or
+#          * it is a control plane whose cluster still has OTHER nodes (that would fork one
+#            cluster into two).
+#        It only ever touches THIS machine's local Kubernetes state, which - in the state that
+#        triggers it - belongs to nobody. kubeos-storage-init (re-run by node-setup.service) is
+#        idempotent: it checks blkid before formatting, so pod data is never re-created.
+#        Every failure is logged; a failure leaves the machine as it was, still joinable by hand.
+
+set -eu
+
+log() { printf 'kubeos-node-standalone: %s\n' "$*"; }
+die() { printf 'kubeos-node-standalone: ERROR: %s\n' "$*" >&2; exit 1; }
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+KUBECTL=/usr/bin/kubectl
+SYSTEMCTL=/usr/bin/systemctl
+MARKER=/var/lib/kubeos/initialized
+ADMIN_CONF=/etc/kubernetes/admin.conf
+DASHBOARD_CONF=/etc/kubeos-dashboard
+DASHBOARD_KUBECONFIG=$DASHBOARD_CONF/kubeconfig
+SETUP_UNIT=node-setup.service
+SETUP_TIMEOUT=900
+DASHBOARD_UNITS="kubeos-dashboard kubeos-dashboard-auth kubeos-console"
+# Where a dashboard installer may live, most official first.
+INSTALL_SH_CANDIDATES="/usr/share/kubeos/dashboard/install.sh
+/root/kubeos-dashboard-0.1.0-linux-amd64/install.sh"
+
+[ "$(id -u)" -eq 0 ] || die "run this as root"
+HOST=$(cat /etc/hostname 2>/dev/null || hostname)
+
+# ---- 1. refuse when there is nothing to do ---------------------------------
+if [ -s "$DASHBOARD_KUBECONFIG" ] && [ -x "$KUBECTL" ]; then
+    if "$KUBECTL" --kubeconfig "$DASHBOARD_KUBECONFIG" get node "$HOST" -o name \
+        >/dev/null 2>&1; then
+        log "this machine is still a node of the cluster its dashboard points at - nothing to do"
+        exit 0
+    fi
+fi
+
+# A control plane that still has other nodes must not promote itself: it would become a second,
+# independent cluster with the same name. (Only checkable while its own API answers.)
+# Counted by NAME, and only when the API actually answered: `awk 'NR>1'` over a --no-headers
+# listing dropped a real node instead of a header, and `|| other_nodes=0` turned "the API did not
+# answer" into "no other nodes" - the answer that permits forking a live cluster (same defect as
+# the guard in kubeos-node-join, found in the 2026-11-13 audit).
+if [ -f "$ADMIN_CONF" ] && [ -x "$KUBECTL" ]; then
+    if node_names=$("$KUBECTL" --kubeconfig "$ADMIN_CONF" get nodes --no-headers \
+            -o custom-columns=NAME:.metadata.name 2>/dev/null); then
+        # shellcheck disable=SC2126  # same reason as in kubeos-node-join: `grep -c` exits 1 on 0
+        other_nodes=$(printf '%s\n' "$node_names" | sed '/^$/d' |
+            grep -v -x -F "$HOST" | wc -l)
+        if [ "$other_nodes" -gt 0 ]; then
+            die "this machine is the control plane of a cluster that still has ${other_nodes} other node(s); refusing to fork it"
+        fi
+    else
+        log "note: this machine's cluster did not answer, so it has no members to protect"
+    fi
+fi
+
+log "starting from: host=$HOST marker=$([ -f "$MARKER" ] && echo present || echo absent) admin.conf=$([ -f "$ADMIN_CONF" ] && echo present || echo absent)"
+
+# ---- 2. discard the worker identity ----------------------------------------
+# This is the state that triggers the whole thing: a kubelet with a certificate the cluster no
+# longer accepts. Dropping it is the same cleanup kubeos-node-join does before it joins.
+# THIS MACHINE MAY STILL BE ITS OWN CONTROL PLANE (it was a standalone node and is being rebuilt
+# again, which is what a second removal does). Its units have to be STOPPED before their data is
+# deleted: etcd holds the old store in memory, re-creates /var/lib/etcd on shutdown, and the new
+# kubeadm run then applies its objects into a half-old store. Measured on kubeos2 on 2026-11-12:
+# the rebuild hung for minutes, node-setup ended with `kubernetes-admin` FORBIDDEN, the dashboard
+# could never see the cluster again - and the browser sat on "this machine is not part of a
+# cluster" for ever, which is the "no bar, no reload" the user reported.
+CP_UNITS="etcd kube-apiserver kube-controller-manager kube-scheduler kube-proxy
+kubeos-coredns kubeos-metrics-server kubeos-storage-provisioner"
+log "stopping kubelet and discarding the old cluster identity"
+"$SYSTEMCTL" stop kubelet >/dev/null 2>&1 || true
+# shellcheck disable=SC2086  # deliberately unquoted: one argument per unit
+"$SYSTEMCTL" stop $CP_UNITS >/dev/null 2>&1 || true
+# shellcheck disable=SC2086
+"$SYSTEMCTL" reset-failed $CP_UNITS >/dev/null 2>&1 || true
+# Give etcd a moment to flush and exit, or its shutdown would write the store back over the very
+# files removed on the next line. A unit that refuses to stop is reported, never fatal: by here
+# the node is already half dismantled, so dying would leave it with no cluster at all.
+who=0
+while [ "$who" -lt 20 ]; do
+    still=$("$SYSTEMCTL" is-active etcd 2>/dev/null || true)
+    case $still in active | activating | deactivating) who=$((who + 1)); sleep 1 ;; *) break ;; esac
+done
+[ "$("$SYSTEMCTL" is-active etcd 2>/dev/null || true)" = "inactive" ] ||
+    log "WARNING: etcd did not stop within 20s - its data may come back; check: systemctl status etcd"
+rm -rf /etc/kubernetes/* /var/lib/kubelet /etc/cni/net.d/* /var/lib/etcd/*
+# ...and the BRIDGE and its leases. Wiping only /etc/cni/net.d leaves `cni0` carrying the gateway
+# address of the membership this machine just left, and the bridge plugin then refuses to reuse it
+# with the new podCIDR: "cni0 already has an IP address different from 10.244.x.1/24". The node
+# reports Ready, the scheduler places pods on it, and every one of them sits in ContainerCreating
+# for ever (measured 2026-11-13 on a re-joined node; the join script has dropped these since then,
+# this rebuild path did not).
+ip link del cni0 >/dev/null 2>&1 || true
+rm -rf /var/lib/cni/networks/kubeos /var/lib/cni/networks/kubeos-* 2>/dev/null || true
+install -d -m 0700 /etc/kubernetes
+# node-setup must run again, so its ConditionPathExists=/!$MARKER has to pass.
+rm -f "$MARKER"
+
+# ---- 3. build this machine's own one-node cluster --------------------------
+# The same three ExecStart= steps first boot uses (storage, node-setup, node-ready). Stopping the
+# unit first matters: it is Type=oneshot with RemainAfterExit=yes, so it stays "active" for ever
+# after the first boot and a bare `start` would be a no-op.
+log "bringing this machine's own control plane up ($SETUP_UNIT, up to ${SETUP_TIMEOUT}s)"
+"$SYSTEMCTL" reset-failed "$SETUP_UNIT" >/dev/null 2>&1 || true
+"$SYSTEMCTL" stop "$SETUP_UNIT" >/dev/null 2>&1 || true
+"$SYSTEMCTL" start --no-block "$SETUP_UNIT" >/dev/null 2>&1 ||
+    die "could not start $SETUP_UNIT (is it installed? check: systemctl status $SETUP_UNIT)"
+
+waited=0
+while [ "$waited" -lt "$SETUP_TIMEOUT" ]; do
+    state=$("$SYSTEMCTL" is-active "$SETUP_UNIT" 2>/dev/null || true)
+    [ "$state" = "active" ] && break
+    [ "$state" = "failed" ] && break
+    sleep 5
+    waited=$((waited + 5))
+done
+result=$("$SYSTEMCTL" show "$SETUP_UNIT" -p Result --value 2>/dev/null || echo unknown)
+if [ "$result" != "success" ]; then
+    die "$SETUP_UNIT finished with Result=$result after ${waited}s - this machine is unchanged and still joinable by hand (journalctl -u $SETUP_UNIT -n 80)"
+fi
+log "$SETUP_UNIT finished successfully after ${waited}s"
+
+# ---- 4. point this machine's dashboard at ITS OWN cluster ------------------
+# install.sh is the supported path (it creates/adopts the CA, signs the leaf for this node's
+# addresses, publishes the console token and restarts the units). Without it, the minimum that
+# makes the dashboard usable is the local admin kubeconfig - and it says so, because the
+# certificate will then be the one from before.
+if [ ! -f "$ADMIN_CONF" ]; then
+    die "no $ADMIN_CONF after the setup ran - refusing to leave a dashboard pointing nowhere"
+fi
+installed=0
+while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    [ -x "$candidate" ] || continue
+    log "re-pointing this dashboard at the new local cluster with $candidate"
+    workdir=$(dirname "$candidate")
+    if (cd "$workdir" && ./install.sh --kubeconfig "$ADMIN_CONF" >/tmp/kubeos-node-standalone-install.log 2>&1); then
+        installed=1
+        break
+    fi
+    log "WARNING: $candidate failed (see /tmp/kubeos-node-standalone-install.log); trying the fallback"
+done <<CANDIDATES
+$INSTALL_SH_CANDIDATES
+CANDIDATES
+
+if [ "$installed" -eq 0 ]; then
+    log "WARNING: no working install.sh on this machine - copying the local admin kubeconfig instead"
+    owner=kubeos-dashboard
+    getent passwd "$owner" >/dev/null 2>&1 || owner=root
+    install -d -m 0755 "$DASHBOARD_CONF"
+    # Headlamp names the cluster after the kubeconfig CONTEXT, and every URL carries it (/c/main/),
+    # so the copy gets the same context name the installer would have given it.
+    sed 's/^current-context: .*/current-context: main/;
+         s/name: kubernetes-admin@kubernetes/name: main/' "$ADMIN_CONF" > "$DASHBOARD_CONF/kubeconfig.tmp" ||
+        { rm -f "$DASHBOARD_CONF/kubeconfig.tmp"; die "could not prepare the dashboard kubeconfig"; }
+    install -m 0600 -o "$owner" -g "$owner" "$DASHBOARD_CONF/kubeconfig.tmp" "$DASHBOARD_KUBECONFIG"
+    rm -f "$DASHBOARD_CONF/kubeconfig.tmp"
+    log "note: the dashboard certificate was NOT re-signed - run install.sh --kubeconfig $ADMIN_CONF to fix it"
+fi
+
+# ---- 5. restart what serves the page --------------------------------------
+# shellcheck disable=SC2086  # deliberately unquoted: one argument per unit
+"$SYSTEMCTL" try-restart $DASHBOARD_UNITS >/dev/null 2>&1 ||
+    log "note: could not restart $DASHBOARD_UNITS (not installed on this machine?)"
+
+if "$KUBECTL" --kubeconfig "$ADMIN_CONF" get node "$HOST" -o name >/dev/null 2>&1; then
+    log "done: this machine is a standalone KubeOS node again (its own cluster, itself as the only node)"
+    log "      attach it to a cluster from its dashboard: Join Cluster page"
+else
+    die "the local API does not answer for $HOST after the setup - check: systemctl status etcd kube-apiserver kubelet"
+fi

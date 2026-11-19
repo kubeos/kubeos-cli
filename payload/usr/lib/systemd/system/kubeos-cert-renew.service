@@ -1,0 +1,21 @@
+# KubeOS: renew the control-plane certificates before they expire (365-day leaves).
+#
+# WHY A SEPARATE UNIT: renewing is a sequence of restarts with health gates, which is not
+# something a timer can express. The script does nothing unless a certificate is inside its
+# window, so a weekly run costs one `openssl` pass and nothing else.
+#
+# It changes /etc/kubernetes, so it runs as root with no sandbox; it takes its own etcd snapshot
+# and cert backup BEFORE touching anything (see the script header for the rollback).
+[Unit]
+Description=KubeOS certificate renewal (control plane only)
+Documentation=https://kubeos.in/
+# The control plane must be up; on a worker the script exits immediately by itself.
+After=network-online.target kube-apiserver.service etcd.service
+Wants=network-online.target
+ConditionPathExists=/etc/kubernetes/admin.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/kubeos-cert-renew
+TimeoutStartSec=900
+Nice=10

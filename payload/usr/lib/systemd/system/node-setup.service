@@ -1,0 +1,41 @@
+[Unit]
+Description=KubeOS node setup: initialise Kubernetes on this node
+Documentation=https://kubeos.in/
+# Only on an installed system, never inside the live session.
+ConditionKernelCommandLine=!boot=live
+# Run once per machine: the marker is written only when everything succeeded.
+ConditionPathExists=!/var/lib/kubeos/initialized
+After=network-online.target NetworkManager-wait-online.service containerd.service
+Wants=network-online.target NetworkManager-wait-online.service
+Requires=containerd.service
+# Retry a failed node setup instead of needing a human: the scripts are
+# idempotent (node-setup skips kubeadm init when admin.conf exists,
+# node-ready re-applies the CNI). Give up after roughly an hour of
+# attempts so a truly broken host leaves a clear failure in the journal instead
+# of looping forever.
+StartLimitIntervalSec=3600
+StartLimitBurst=60
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Storage first: kubeos-storage-init creates the pod-data thin pool, formats it
+# and mounts it at /opt/local-path-provisioner. It must run before the node
+# exists so that anything scheduled afterwards already writes to the pool instead
+# of to the root filesystem. It is warn-only, so a node without it still builds.
+ExecStart=/usr/bin/kubeos-storage-init
+ExecStart=/usr/bin/node-setup
+ExecStart=/usr/bin/node-ready
+Restart=on-failure
+RestartSec=60
+# Journal only, never the console. `journal+console` writes to /dev/kmsg and the
+# VT directly, which tears through the Plymouth splash as soon as this unit starts
+# and keeps scribbling over the login prompt for minutes afterwards (kubeadm init
+# plus the CNI rollout). Watch progress with:
+#     journalctl -u node-setup -b -f
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

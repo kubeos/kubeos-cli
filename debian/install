@@ -1,0 +1,8 @@
+payload/usr/bin/*                                     usr/bin/
+payload/usr/lib/systemd/system/*.service              usr/lib/systemd/system/
+payload/usr/lib/systemd/system/*.timer                usr/lib/systemd/system/
+payload/usr/lib/systemd/system/multi-user.target.wants/*  usr/lib/systemd/system/multi-user.target.wants/
+payload/usr/lib/systemd/system/timers.target.wants/*      usr/lib/systemd/system/timers.target.wants/
+payload/etc/kubeos/kubeos.conf                        etc/kubeos/
+payload/usr/share/kubeos/manifests/native-services.yaml   usr/share/kubeos/manifests/
+payload/usr/share/kubeos/examples/nfs-static-pv.yaml      usr/share/kubeos/examples/

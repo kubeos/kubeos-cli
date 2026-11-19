@@ -1,0 +1,15 @@
+[Unit]
+Description=KubeOS disk report every minute
+Documentation=https://kubeos.in/
+
+[Timer]
+# First run a little after boot so the cluster setup unit has had its chance,
+# then once a minute: the dashboard's Disks page should never be more than about
+# a minute stale, and the script writes nothing when the numbers do not change.
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=kubeos-disks-report.service
+
+[Install]
+WantedBy=timers.target

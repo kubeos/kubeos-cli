@@ -1,0 +1,91 @@
+#!/bin/sh
+# KubeOS: publish this node's LVM facts as a ConfigMap the dashboard can read.
+#
+# WHEN   kubeos-disks-report.timer, every minute once the cluster exists (enabled
+#        by step 8 of node-ready).
+# WHY    The dashboard runs as a pod, so it cannot run vgs/lvs on the host, and
+#        Kubernetes has no object for LVM at all - there is nothing for the API to
+#        serve. A ConfigMap refreshed here is the only unprivileged bridge: no
+#        privileged pod, no host mount, no extra daemon, and it works offline.
+#        The Disks page of the KubeOS dashboard renders exactly this.
+# SAFE   Read-only towards LVM (vgs/pvs/lvs are queries). Only one object is
+#        written, in the kubeos-system namespace, and only when its content
+#        actually changed - so a quiet cluster produces no write traffic.
+#        Any failure logs a warning and exits 0: missing disk data must never be
+#        the reason a node looks broken.
+set -eu
+
+KUBECONFIG_FILE=/etc/kubernetes/admin.conf
+NAMESPACE=kubeos-system
+CM=kubeos-disks
+
+log() { echo "kubeos-disks-report: $*"; logger -t kubeos-disks-report "$*" 2>/dev/null || true; }
+warn() { log "WARNING: $*"; }
+
+# The cluster may simply not exist yet (early boot, or an unformed cluster).
+[ -r "$KUBECONFIG_FILE" ] || { warn "$KUBECONFIG_FILE missing; is the cluster initialised?"; exit 0; }
+export KUBECONFIG="$KUBECONFIG_FILE"
+command -v kubectl >/dev/null 2>&1 || { warn "kubectl not installed"; exit 0; }
+
+if ! vgs >/dev/null 2>&1; then
+    warn "no volume group on this node; nothing to report"
+    exit 0
+fi
+
+# Raw LVM JSON, passed through untouched: lvm already emits machine-readable
+# reports, and re-encoding them here would only add a dependency (jq, python)
+# and a place for the numbers to drift.
+vgs_json=$(vgs --reportformat json 2>/dev/null || true)
+pvs_json=$(pvs --reportformat json 2>/dev/null || true)
+# The columns the dashboard's Disks pages actually render. lvm's DEFAULT report
+# has no chunk_size, and a thin pool without it cannot be described properly, so
+# the column list is explicit instead of default. -a adds the pool's own sub-LVs;
+# the dashboard filters those out, and having the real thing beats guessing.
+LVS_COLUMNS=lv_name,vg_name,lv_attr,lv_size,pool_lv,data_percent,metadata_percent,chunk_size
+lvs_json=$(lvs -a -o "$LVS_COLUMNS" --reportformat json 2>/dev/null || true)
+# Block devices, for the dashboard's disk pickers: lsblk already reports
+# partitions, filesystems and LVM members, so the dashboard can offer only disks
+# that are genuinely empty instead of guessing from a size. -e 7 skips loop
+# devices, which are not candidates for a volume group.
+BLOCK_COLUMNS=NAME,KNAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+lsblk_json=$(lsblk -b -J -e 7 -o "$BLOCK_COLUMNS" 2>/dev/null || true)
+
+if [ -z "$vgs_json" ] || [ -z "$lvs_json" ]; then
+    warn "lvm reports came back empty; keeping the previous ConfigMap"
+    exit 0
+fi
+if [ -z "$lsblk_json" ]; then
+    # Not fatal: the LVM tables are the point of this report, the disk list only
+    # feeds the "create" dialogs, which then report that this node offers none.
+    warn "lsblk returned nothing; the disk picker will be empty"
+fi
+
+node=$(hostname)
+generated=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Nothing to do when the reports are unchanged: writing the ConfigMap wakes every
+# watcher in the cluster, and this runs every minute. Compare the payload only -
+# comparing the timestamp as well made this check a no-op, because `generated` is
+# new on every run, so the ConfigMap was rewritten every single minute.
+current=$(kubectl -n "$NAMESPACE" get configmap "$CM" \
+    -o jsonpath='{.data.vgs\.json}{.data.pvs\.json}{.data.lvs\.json}{.data.lsblk\.json}' 2>/dev/null || true)
+if [ -n "$current" ] && [ "$current" = "$vgs_json$pvs_json$lvs_json$lsblk_json" ]; then
+    log "unchanged; not rewriting the ConfigMap"
+    exit 0
+fi
+
+kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml 2>/dev/null | kubectl apply -f - >/dev/null 2>&1 || true
+
+if kubectl -n "$NAMESPACE" create configmap "$CM" \
+        --from-literal="node=$node" \
+        --from-literal="generated=$generated" \
+        --from-literal="vgs.json=$vgs_json" \
+        --from-literal="pvs.json=$pvs_json" \
+        --from-literal="lvs.json=$lvs_json" \
+        --from-literal="lsblk.json=$lsblk_json" \
+        --dry-run=client -o yaml 2>/dev/null | kubectl apply -f - >/dev/null 2>&1; then
+    log "published $NAMESPACE/$CM (node $node, $generated)"
+else
+    warn "could not write ConfigMap $NAMESPACE/$CM"
+fi
+exit 0

@@ -1,0 +1,508 @@
+#!/bin/sh
+# WHEN   run as root on a freshly installed KubeOS node that must become a WORKER of an
+#        existing cluster. It is what the dashboard's "Join node" page runs, and it is
+#        safe to run by hand from the console or SSH:
+#            kubeos-node-join 'KOSJOIN1.…'                 # the string the dashboard prints
+#            kubeos-node-join 'kubeadm join 10.0.0.11:6443 --token … --discovery-token-ca-cert-hash sha256:…'
+#
+# WHY    a stock KubeOS install always brings up a complete one-node CONTROL PLANE -
+#        etcd, apiserver, controller-manager, scheduler, CoreDNS, metrics-server, the
+#        storage provisioner and the disks timer - because that is what the first boot is
+#        for. A worker must run none of those, and must discard its own cluster before it
+#        can join another. Measured on a real second node (kubeos2, 2026-11-12): without
+#        steps 1-3 the join either silently kept the old cluster or failed in preflight.
+#        This script is the whole difference between "install a node" and "install a
+#        cluster", and it is the only thing that has to happen for the dashboard to serve
+#        that node too (same binary, same port, its own kubeconfig).
+#        It also gives the worker a kube-proxy identity (step 4b): `kubeadm join` writes the
+#        component config but never the kubeconfig, so without it the unit is silently skipped
+#        and Service addresses do not work on that node at all (measured 2026-11-13).
+#
+# SAFE   refuses to run on a control plane that still has other nodes depending on it; it
+#        never touches the export or the storage; steps are ordered so a failure leaves the
+#        node in a state the script can be re-run against.
+set -eu
+
+log() { printf 'kubeos-node-join: %s\n' "$*"; }
+die() { printf 'kubeos-node-join: ERROR: %s\n' "$*" >&2; exit 1; }
+
+CRI_SOCKET=unix:///run/containerd/containerd.sock
+STATE=/var/lib/kubeos
+ADMIN_CONF=/etc/kubernetes/admin.conf
+# Every unit the ISO brings up for the one-node control plane, plus the timer that reports
+# this machine's disks into it. A worker keeps containerd, kubelet and kube-proxy only.
+CONTROL_PLANE_UNITS="etcd kube-apiserver kube-controller-manager kube-scheduler
+kubeos-coredns kubeos-metrics-server kubeos-storage-provisioner"
+CONTROL_PLANE_EXTRA="kubeos-disks-report.timer"
+CNI_CONF=/etc/cni/net.d/10-kubeos.conflist
+# Handed over inside the join string (see the decoder above) and adopted at the end.
+JOIN_DASHBOARD_CONF=/run/kubeos-join-dashboard.conf
+DASHBOARD_CONF=/etc/kubeos-dashboard
+DASHBOARD_KUBECONFIG=$DASHBOARD_CONF/kubeconfig
+# kubeos-console is in the list because the Shell button talks to it, and it reads the token
+# below - restarting the other two without it would leave a Shell that still says "bad token".
+DASHBOARD_UNITS="kubeos-dashboard kubeos-dashboard-auth kubeos-console"
+CONSOLE_TOKEN=$DASHBOARD_CONF/console.token
+# ONE name per cluster (see install.sh): every node of a cluster must run the console with
+# the token the cluster publishes, because that is the one the dashboard page reads.
+CONSOLE_SECRET=kubeos-console-token
+NODE_READY_TIMEOUT=180
+# kube-proxy needs TWO files and `kubeadm join` writes only one of them: the component config
+# (/var/lib/kube-proxy/config.conf) comes from the join, but the identity in /etc/kubernetes/
+# kube-proxy.conf does not exist on a worker - and the unit's ConditionPathExists then skips it
+# silently. See install_kube_proxy below.
+PROXY_CONF=/etc/kubernetes/kube-proxy.conf
+PROXY_CONFIG=/var/lib/kube-proxy/config.conf
+PROXY_SA=kubeos-kube-proxy
+PROXY_TOKEN_SECRET=kubeos-kube-proxy-token
+PROXY_CRB=kubeos:kube-proxy
+
+[ "$(id -u)" -eq 0 ] || die "run this as root"
+[ $# -eq 1 ] || die "usage: $0 '<join string from the dashboard, or a kubeadm join command>'"
+BUNDLE=$1
+
+# ---- decode the join string ------------------------------------------------
+# Two accepted forms, because the dashboard prints the first and an operator following the
+# Kubernetes documentation types the second.
+case $BUNDLE in
+    KOSJOIN1.*)
+        decoded=$(python3 - "$BUNDLE" <<'PY'
+import base64, json, sys
+raw = sys.argv[1][len("KOSJOIN1."):]
+try:
+    data = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode())
+except Exception:                      # a traceback here would only look like a crash
+    sys.exit("that join string is not valid base64/JSON - copy the whole value again")
+if not isinstance(data, dict):
+    sys.exit("that join string is not a KubeOS join string")
+missing = [k for k in ("endpoint", "token", "caHash") if not data.get(k)]
+if missing:
+    sys.exit("the join string is missing: " + ", ".join(missing))
+print(data["endpoint"], data["token"], data["caHash"])
+# The dashboard's own kubeconfig, minted on the control plane (a `kubeos-dashboard`
+# service account) and carried inside this same string: after the join this node's
+# dashboard must talk to the JOINED cluster, not to the one kubeadm reset just deleted.
+# Written outside $() so it survives: see JOIN_DASHBOARD_CONF below.
+handover = (data.get("kubeconfig") or "").strip()
+if handover:
+    with open("/run/kubeos-join-dashboard.conf", "w", encoding="utf-8") as handle:
+        handle.write(handover + "\n")
+    import os as _os
+    _os.chmod("/run/kubeos-join-dashboard.conf", 0o600)
+PY
+) || die "could not read that join string (is it complete?)"
+        # shellcheck disable=SC2086  # three space-separated fields by construction
+        set -- $decoded
+        [ $# -eq 3 ] || die "the join string did not decode to endpoint, token and hash"
+        JOIN_ENDPOINT=$1
+        JOIN_TOKEN=$2
+        JOIN_CA_HASH=$3
+        ;;
+    "kubeadm join "*)
+        log "using the given kubeadm join command as-is"
+        JOIN_COMMAND=$BUNDLE
+        ;;
+    *)
+        die "expected 'KOSJOIN1.…' or a 'kubeadm join …' command"
+        ;;
+esac
+
+# ---- refuse to destroy a control plane that other nodes rely on -------------
+# THIS GUARD USED TO FAIL OPEN. `kubectl … 2>/dev/null | awk 'NR>1' | wc -l` printed 1 for a
+# one-node cluster (the awk dropped the FIRST row of a --no-headers listing, not a header) and,
+# worse, printed 0 when the API could not be read at all - and 0 is exactly the answer that lets
+# the script go on to `kubeadm reset` + `rm -rf /etc/kubernetes/*`, i.e. wipe a live control plane.
+# Now the node list is counted by NAME (this host's row removed), and an unreadable API refuses
+# the join unless the operator says so explicitly: KUBEOS_JOIN_ALLOW_UNKNOWN=1.
+if [ -f "$ADMIN_CONF" ]; then
+    if node_names=$(kubectl --kubeconfig="$ADMIN_CONF" get nodes --no-headers \
+            -o custom-columns=NAME:.metadata.name 2>/dev/null); then
+        # shellcheck disable=SC2126  # `grep -c` exits 1 when it counts zero, which set -e would
+        #                            # treat as a failure - wc -l always answers.
+        other_nodes=$(printf '%s\n' "$node_names" | sed '/^$/d' |
+            grep -v -x -F "$(hostname)" | wc -l)
+        if [ "$other_nodes" -gt 0 ]; then
+            die "this node is the control plane of a cluster that already has ${other_nodes} other node(s). Refusing to wipe it."
+        fi
+        log "this node's own cluster has no other member - safe to replace it"
+    elif [ "${KUBEOS_JOIN_ALLOW_UNKNOWN:-0}" = "1" ]; then
+        log "WARNING: could not read this node's own cluster, continuing because KUBEOS_JOIN_ALLOW_UNKNOWN=1"
+    else
+        die "cannot read this node's own cluster ($ADMIN_CONF), so it is impossible to tell whether other nodes depend on it. Re-run with KUBEOS_JOIN_ALLOW_UNKNOWN=1 if you know it is dead."
+    fi
+fi
+
+# ---- adopt the dashboard this node already runs ---------------------------
+# A freshly installed node that had the dashboard installed serves it from ITS OWN one-node
+# cluster. `kubeadm reset` above deleted that cluster, so unless something re-points it, the
+# browser shows Headlamp's "Failed to get authentication information" for ever - the exact
+# page the user photographed on 2026-11-12, twice. The control plane therefore puts a
+# `kubeos-dashboard` service-account kubeconfig inside the SAME join string, and this writes
+# it where the dashboard reads it. Nothing here invents a credential.
+adopt_dashboard() {
+    if [ ! -f "$DASHBOARD_KUBECONFIG" ]; then
+        log "no dashboard on this node (no $DASHBOARD_KUBECONFIG) - nothing to re-point"
+        return 0
+    fi
+    if [ ! -s "$JOIN_DASHBOARD_CONF" ]; then
+        log "WARNING: this join string carried no dashboard kubeconfig, so this node's dashboard"
+        log "         still points at the cluster that was just deleted. Fix it with:"
+        log "         install.sh --kubeconfig <control-plane>/admin.conf"
+        return 0
+    fi
+    # A full install.sh is better than a bare copy: it adopts the cluster CA, re-signs this
+    # node's certificate against it, and re-publishes nothing that already exists. Without it a
+    # join copies the kubeconfig only and the node keeps the CA of the cluster it just left -
+    # every leaf still claims the same issuer name, so the only symptom is a browser warning on
+    # this node after the user was told to import the CA once (measured 2026-11-13: kubeos3 and
+    # kubeos4 served 8A:8B... and 84:72... while the cluster publishes BF:45...). The image path
+    # is what the ISO will ship; until then a node keeps its unpacked release under /root (the
+    # standalone rebuild needs it anyway), so both are tried.
+    installer=""
+    for candidate in /usr/share/kubeos/dashboard/install.sh /root/kubeos-dashboard-*/install.sh; do
+        [ -x "$candidate" ] && { installer=$candidate; break; }
+    done
+    if [ -n "$installer" ]; then
+        log "re-pointing this node's dashboard with $installer"
+        if "$installer" --kubeconfig "$JOIN_DASHBOARD_CONF" --no-start >/dev/null 2>&1; then
+            log "dashboard kubeconfig installed"
+        else
+            log "the image's installer failed; falling back to copying the kubeconfig"
+        fi
+    fi
+    if ! cmp -s "$JOIN_DASHBOARD_CONF" "$DASHBOARD_KUBECONFIG"; then
+        owner=kubeos-dashboard
+        if ! getent passwd "$owner" >/dev/null 2>&1; then owner=root; fi
+        install -m 0600 -o "$owner" -g "$owner" "$JOIN_DASHBOARD_CONF" "$DASHBOARD_KUBECONFIG" ||
+            die "could not write $DASHBOARD_KUBECONFIG"
+        log "this node's dashboard now points at the joined cluster ($DASHBOARD_KUBECONFIG)"
+    fi
+    # THE CONSOLE TOKEN IS PART OF THE HANDOVER, and this is why: the dashboard page reads it from
+    # Secret kubeos-system/kubeos-console-token, while the console on THIS machine compares against
+    # the file on its own disk. A node that installed its dashboard while it was still its own
+    # cluster has its OWN token there, so right after a join every Shell click is refused with
+    # "bad token" even though the dashboard itself works - measured 2026-11-12 on kubeos2 (user:
+    # "now i am unable to access the shell from kubeos2 dashboard"). install.sh adopts it; the join
+    # has to do the same or the join is only half done.
+    cluster_token=$(kubectl --kubeconfig "$DASHBOARD_KUBECONFIG" -n kubeos-system get secret \
+        "$CONSOLE_SECRET" -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null) ||
+        cluster_token=""
+    if [ -n "$cluster_token" ] && [ -s "$CONSOLE_TOKEN" ] &&
+        [ "$cluster_token" != "$(cat "$CONSOLE_TOKEN")" ]; then
+        (umask 077 && printf '%s\n' "$cluster_token" > "$CONSOLE_TOKEN") ||
+            log "WARNING: could not write $CONSOLE_TOKEN (the Shell button may refuse this node)"
+        chmod 0600 "$CONSOLE_TOKEN" 2>/dev/null || true
+        log "adopted the console token this cluster publishes (the Shell button needs it)"
+    fi
+    # shellcheck disable=SC2086  # three unit names, deliberately unquoted
+    systemctl try-restart $DASHBOARD_UNITS >/dev/null 2>&1 ||
+        log "note: could not restart $DASHBOARD_UNITS (not installed?)"
+    return 0
+}
+
+# ---- 1. this machine stops being a control plane ---------------------------
+log "disabling the control-plane units (a worker runs containerd, kubelet and kube-proxy only)"
+# NO "does this unit exist" guard around the disable. The first version used
+#     systemctl list-unit-files "$unit" | grep -q "$unit"
+# and `list-unit-files` takes a PATTERN that must carry the type suffix: `list-unit-files etcd`
+# answers "0 unit files listed" and exits 1 on systemd 257, so the guard was false for all seven
+# bare service names and NOTHING was ever disabled (only the timer, which has its suffix). The
+# worker kept running - and restart-looping - kube-controller-manager and kube-scheduler, whose
+# configs `kubeadm reset` had just deleted. Measured 2026-11-12 on the first two-node test.
+# `disable --now` on a missing unit is harmless, so the honest version just does it.
+for unit in $CONTROL_PLANE_UNITS $CONTROL_PLANE_EXTRA; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 ||
+        log "note: $unit was not installed or not running (continuing)"
+done
+# A unit that failed because its config is gone stays "failed" for ever otherwise, and a
+# Restart=on-failure service that kubeadm reset broke keeps spinning.
+# shellcheck disable=SC2086  # deliberately unquoted: one argument per unit
+systemctl reset-failed $CONTROL_PLANE_UNITS $CONTROL_PLANE_EXTRA >/dev/null 2>&1 || true
+
+# Say so if it did not take: silence here is how the first version hid the bug. It only
+# WARNS and waits, because by now this node's own cluster is already stopped - dying here
+# would leave a machine with no cluster and no join (measured 2026-11-12: a unit that needs a
+# moment to shut down made this `die`, and the node was left in limbo with a dead dashboard).
+wait_left=20
+while [ "$wait_left" -gt 0 ]; do
+    still_running=0
+    for unit in $CONTROL_PLANE_UNITS; do
+        case $(systemctl is-active "$unit" 2>/dev/null) in
+            active | activating | deactivating) still_running=$((still_running + 1)) ;;
+        esac
+    done
+    [ "$still_running" -eq 0 ] && break
+    sleep 1
+    wait_left=$((wait_left - 1))
+done
+if [ "$still_running" -ne 0 ]; then
+    log "WARNING: $still_running control-plane unit(s) are still running; this node will keep"
+    log "         restarting things it should not. Check: systemctl list-units 'etcd*' 'kube-*'"
+    log "         Continuing anyway: the cluster has already been stopped, so aborting now"
+    log "         would leave this node with neither cluster nor join."
+fi
+
+# ---- 2. discard the one-node cluster --------------------------------------
+log "discarding this node's own cluster (kubeadm reset)"
+if ! kubeadm reset --force --cri-socket "$CRI_SOCKET" >/tmp/kubeos-node-join-reset.log 2>&1; then
+    log "kubeadm reset reported a failure; see /tmp/kubeos-node-join-reset.log (continuing)"
+fi
+rm -rf /etc/kubernetes/* /var/lib/etcd/* /etc/cni/net.d/* /var/lib/kubelet
+
+# ---- 2b. the control-plane units must not come back after the reset --------
+# WHY A SECOND PASS, AFTER the reset rather than only before it: the `disable --now` above runs
+# while the old cluster still exists. `kubeadm reset` then deletes the PKI and the data
+# directory, and a unit that was mid-`Restart=on-failure` gets an AUTOMATIC restart job queued -
+# and that job does not re-check the unit's `ConditionPathExists`. Measured 2026-11-12 on
+# kubeos2: etcd restarted itself 44 times, every 5 s, for 12 minutes, failing on
+# `open /etc/kubernetes/pki/etcd/peer.crt: no such file or directory`, while `is-enabled` said
+# `disabled` and the condition file did not exist. Stopping them once the data is actually gone
+# is the only moment the stop cannot be raced.
+# Never abort here: this machine has no cluster of its own any more, so a failure must warn.
+for unit in $CONTROL_PLANE_UNITS $CONTROL_PLANE_EXTRA; do
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+done
+still_running=0
+for unit in $CONTROL_PLANE_UNITS; do
+    case $(systemctl is-active "$unit" 2>/dev/null) in
+        active | activating | deactivating) still_running=$((still_running + 1)) ;;
+    esac
+done
+if [ "$still_running" -ne 0 ]; then
+    # shellcheck disable=SC2086  # deliberately unquoted: one argument per unit
+    log "WARNING: $still_running control-plane unit(s) came back after the reset - stop them by hand:"
+    # shellcheck disable=SC2086
+    log "         systemctl stop $CONTROL_PLANE_UNITS"
+fi
+# The first-boot marker stays: node-setup must NOT run again on reboot and rebuild a
+# control plane on this machine.
+mkdir -p "$STATE"
+
+# ---- 2c. remove this machine's own stale Node record from the cluster ------
+# kubeadm refuses to start when the target cluster still holds a Node object with this
+# hostname: `error execution phase kubelet-start: a Node with name "kubeos2" and status
+# "Ready" already exists in the cluster` (measured 2026-11-12, on a re-join after an
+# interrupted one). A re-join is exactly what a user does when the first attempt went
+# wrong, so this must not need a hand-run `kubectl delete node`. The join string carries
+# the cluster's dashboard kubeconfig (cluster-admin), which is the only credential this
+# machine has for the NEW cluster before it joins - use it to delete our own record only.
+# Without that kubeconfig there is nothing to authenticate with and the join will report
+# the same error, so the operator must delete the object by hand.
+THIS_NODE=$(hostname)
+if [ -s "$JOIN_DASHBOARD_CONF" ]; then
+    if kubectl --kubeconfig="$JOIN_DASHBOARD_CONF" get node "$THIS_NODE" >/dev/null 2>&1; then
+        log "the cluster still has a node record named $THIS_NODE - deleting it before joining"
+        # Not a fatal error: the join below reports the real reason if the record survives.
+        kubectl --kubeconfig="$JOIN_DASHBOARD_CONF" delete node "$THIS_NODE" --ignore-not-found ||
+            log "WARNING: could not delete the old $THIS_NODE node record - the join may refuse"
+    fi
+fi
+
+# ---- 3. join ---------------------------------------------------------------
+if [ -n "${JOIN_COMMAND:-}" ]; then
+    log "joining with: $JOIN_COMMAND"
+    # shellcheck disable=SC2086
+    $JOIN_COMMAND --cri-socket "$CRI_SOCKET" || die "kubeadm join failed"
+else
+    log "joining $JOIN_ENDPOINT"
+    kubeadm join "$JOIN_ENDPOINT" --token "$JOIN_TOKEN" \
+        --discovery-token-ca-cert-hash "$JOIN_CA_HASH" \
+        --cri-socket "$CRI_SOCKET" || die "kubeadm join failed (is the token still valid? does the control plane run 'kubeadm init phase bootstrap-token'?)"
+fi
+
+# ---- 4. CNI for the podCIDR the control plane assigned --------------------
+# The controller-manager of the JOINED cluster stamps node.spec.podCIDR; this node's CNI
+# must use that range, not the one it picked for its own cluster. Without this the node
+# stays NotReady ("cni plugin not configured") and its pods get addresses nothing routes.
+log "waiting for the controller-manager to assign a podCIDR"
+i=1
+NODE_POD_CIDR=""
+while [ "$i" -le 60 ]; do
+    NODE_POD_CIDR=$(kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node "$(hostname)" \
+        -o jsonpath='{.spec.podCIDR}' 2>/dev/null || true)
+    [ -n "$NODE_POD_CIDR" ] && break
+    sleep 2
+    i=$((i + 1))
+done
+[ -n "$NODE_POD_CIDR" ] || die "no podCIDR was assigned to $(hostname) within 120 s"
+log "pod network on this node: $NODE_POD_CIDR"
+
+install -d -m 0755 /etc/cni/net.d /opt/cni/bin
+# The bridge from a PREVIOUS membership is still there, carrying the gateway address of the pod
+# network this node had then. The bridge plugin refuses to reuse "cni0" with a different address:
+#     plugin type="bridge" failed (add): failed to set bridge addr: "cni0" already has an IP
+#     address different from 10.244.16.1/24
+# and then EVERY pod scheduled on this node fails to start while the node still reports Ready -
+# measured 2026-11-13 on a node that was removed and rejoined: it was assigned 10.244.16.0/24
+# while cni0 still had 10.244.15.1/24, and its first pod sat in ContainerCreating for ever. The
+# node was reset a moment ago, so nothing local can be using the bridge: drop it and the host-local
+# leases of the old range, and let the first pod recreate both with the new subnet.
+ip link show cni0 >/dev/null 2>&1 && log "removing the cni0 bridge from the previous membership"
+ip link del cni0 >/dev/null 2>&1 || true
+rm -rf /var/lib/cni/networks/kubeos /var/lib/cni/networks/kubeos-* 2>/dev/null || true
+# Keep in sync with the conflist node-setup writes for the control plane: same plugins,
+# same order, only the subnet differs.
+cat > "$CNI_CONF" <<JSON
+{
+  "cniVersion": "1.0.0",
+  "name": "kubeos",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "cni0",
+      "isGateway": true,
+      "ipMasq": true,
+      "hairpinMode": true,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [ [ { "subnet": "$NODE_POD_CIDR" } ] ],
+        "routes": [ { "dst": "0.0.0.0/0" } ]
+      }
+    },
+    {
+      "type": "portmap",
+      "capabilities": { "portMappings": true }
+    }
+  ]
+}
+JSON
+systemctl restart kubelet.service
+
+# ---- 4b. kube-proxy: the identity kubeadm join does not create -------------
+# WHY THIS EXISTS: with the control plane running as native services (no DaemonSet), kube-proxy
+# on a worker has to authenticate with a file, and `kubeadm join` creates only the component
+# config. The unit is gated on /etc/kubernetes/kube-proxy.conf, so the gate fails, systemd calls
+# that "skipped" rather than "failed", and the node looks perfectly healthy while EVERY Service
+# VIP is dead on it. Measured 2026-11-13 on a 4-node cluster: from a pod on the control plane a
+# ClusterIP answered (404 from the test server), from a pod on kubeos2/3/4 both the test Service
+# and the API VIP 10.96.0.1:443 timed out - ClusterIP, NodePort and service DNS all unusable,
+# silently. kubeadm's component config also carried a wrong clusterCIDR (10.245.0.0/16 for a
+# 10.244.0.0/16 cluster), so its values are corrected from the cluster's own kubeadm config.
+# IDENTITY: one ServiceAccount for every node's kube-proxy, bound to the stock system:node-proxier
+# role - that is the same identity the kubeadm DaemonSet would use, so nothing new is trusted.
+# SAFE: warn-only. The node has already joined at this point; a proxy that cannot be installed
+# must not turn a good join into a failure.
+install_kube_proxy() {
+    if [ -s "$PROXY_CONF" ] && systemctl is-active --quiet kube-proxy; then
+        log "kube-proxy is already running on this node"
+        return 0
+    fi
+    [ -r "$DASHBOARD_KUBECONFIG" ] || {
+        log "WARNING: no dashboard kubeconfig ($DASHBOARD_KUBECONFIG), so kube-proxy cannot get an"
+        log "         identity - pods on this node will not reach Service addresses."
+        return 0
+    }
+    kc="kubectl --kubeconfig=$DASHBOARD_KUBECONFIG"
+    endpoint=$($kc config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true)
+    cidr=$($kc -n kube-system get configmap kubeadm-config \
+        -o jsonpath='{.data.ClusterConfiguration}' 2>/dev/null |
+        awk '/podSubnet:/ {print $2; exit}' || true)
+    if [ -z "${endpoint:-}" ] || [ -z "${cidr:-}" ]; then
+        log "WARNING: could not read the API endpoint or the pod subnet; kube-proxy left unconfigured"
+        return 0
+    fi
+
+    # ServiceAccount + binding + non-expiring token. Adopt-or-create: a second node must reuse
+    # the objects the first one made instead of racing them (the Secret is cluster-wide).
+    $kc -n kube-system create serviceaccount "$PROXY_SA" --dry-run=client -o yaml 2>/dev/null |
+        $kc apply -f - >/dev/null 2>&1 || log "WARNING: could not create ServiceAccount $PROXY_SA"
+    $kc create clusterrolebinding "$PROXY_CRB" --clusterrole=system:node-proxier \
+        --serviceaccount=kube-system:"$PROXY_SA" --dry-run=client -o yaml 2>/dev/null |
+        $kc apply -f - >/dev/null 2>&1 || log "WARNING: could not bind $PROXY_CRB to system:node-proxier"
+    if ! $kc -n kube-system get secret "$PROXY_TOKEN_SECRET" >/dev/null 2>&1; then
+        $kc apply -f - >/dev/null 2>&1 <<YAML || log "WARNING: could not create Secret $PROXY_TOKEN_SECRET"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: $PROXY_TOKEN_SECRET
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: $PROXY_SA
+type: kubernetes.io/service-account-token
+YAML
+    fi
+
+    token=""
+    i=1
+    while [ "$i" -le 10 ]; do
+        token=$($kc -n kube-system get secret "$PROXY_TOKEN_SECRET" \
+            -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null || true)
+        [ -n "${token:-}" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+    [ -n "${token:-}" ] || {
+        log "WARNING: the kube-proxy token Secret stayed empty; kube-proxy left unconfigured"
+        return 0
+    }
+
+    ( umask 077
+      $kc config set-cluster kubeos --server="$endpoint" \
+          --certificate-authority=/etc/kubernetes/pki/ca.crt --embed-certs=true \
+          --kubeconfig="$PROXY_CONF" >/dev/null 2>&1
+      $kc config set-credentials system:kube-proxy --token="$token" \
+          --kubeconfig="$PROXY_CONF" >/dev/null 2>&1
+      $kc config set-context system:kube-proxy@kubernetes --cluster=kubeos \
+          --user=system:kube-proxy --kubeconfig="$PROXY_CONF" >/dev/null 2>&1
+      $kc config use-context system:kube-proxy@kubernetes --kubeconfig="$PROXY_CONF" >/dev/null 2>&1
+    ) || { log "WARNING: could not write $PROXY_CONF"; return 0; }
+    chmod 0600 "$PROXY_CONF"
+
+    # The component config: keep what kubeadm wrote, correct the two values that decide routing.
+    if [ -s "$PROXY_CONFIG" ]; then
+        sed -i "s|^clusterCIDR:.*|clusterCIDR: $cidr|; s|^hostnameOverride:.*|hostnameOverride: $(hostname)|" \
+            "$PROXY_CONFIG"
+        grep -q '^clusterCIDR:' "$PROXY_CONFIG" ||
+            printf 'clusterCIDR: %s\n' "$cidr" >> "$PROXY_CONFIG"
+        grep -q '^hostnameOverride:' "$PROXY_CONFIG" ||
+            printf 'hostnameOverride: %s\n' "$(hostname)" >> "$PROXY_CONFIG"
+        grep -q '^clientConnection:' "$PROXY_CONFIG" ||
+            printf 'clientConnection:\n  kubeconfig: %s\n' "$PROXY_CONF" >> "$PROXY_CONFIG"
+    else
+        install -d -m 0750 /var/lib/kube-proxy
+        cat > "$PROXY_CONFIG" <<YAML
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+bindAddress: 0.0.0.0
+clientConnection:
+  kubeconfig: $PROXY_CONF
+clusterCIDR: $cidr
+hostnameOverride: $(hostname)
+mode: iptables
+YAML
+    fi
+
+    systemctl enable kube-proxy >/dev/null 2>&1 || true
+    systemctl restart kube-proxy >/dev/null 2>&1 || true
+    i=1
+    while [ "$i" -le 10 ]; do
+        systemctl is-active --quiet kube-proxy && break
+        sleep 1
+        i=$((i + 1))
+    done
+    if systemctl is-active --quiet kube-proxy; then
+        log "kube-proxy is running with the cluster identity (Service addresses work on this node)"
+    else
+        log "WARNING: kube-proxy did not start - pods on this node will not reach Service addresses."
+        log "         Check: systemctl status kube-proxy; journalctl -u kube-proxy -n 30"
+    fi
+}
+
+# ---- 5. it has to be Ready, not merely joined -----------------------------
+log "waiting for this node to become Ready"
+i=1
+while [ "$i" -le $((NODE_READY_TIMEOUT / 3)) ]; do
+    ready=$(kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node "$(hostname)" \
+        -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || true)
+    if [ "$ready" = "True" ]; then
+        log "$(hostname) is Ready and a worker of the cluster"
+        install_kube_proxy
+        adopt_dashboard
+        exit 0
+    fi
+    sleep 3
+    i=$((i + 1))
+done
+kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node "$(hostname)" -o wide 2>/dev/null || true
+die "the node joined but is not Ready after ${NODE_READY_TIMEOUT}s - check: journalctl -u kubelet -n 50"

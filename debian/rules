@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+# Only /etc/kubeos/kubeos.conf is a conffile in KubeOS; every other /etc file this
+# platform generates at first boot is not shipped at all (see PACKAGING-DECISIONS D5).
+override_dh_installdeb:
+	dh_installdeb
+	printf '%s\n' /etc/kubeos/kubeos.conf > debian/kubeos-cli/DEBIAN/conffiles

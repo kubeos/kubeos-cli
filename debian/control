@@ -1,0 +1,22 @@
+Source: kubeos-cli
+Section: admin
+Priority: optional
+Maintainer: KubeOS <mail@kubeos.in>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://kubeos.in/
+
+Package: kubeos-cli
+Architecture: all
+Depends: ${misc:Depends}, python3, openssl, iproute2, kubeadm, kubectl, kubelet
+Description: KubeOS node orchestration: first boot, certificates, routes, disk facts
+ The commands that turn a freshly installed machine into a working KubeOS node and
+ keep it one: node-setup/node-ready (first boot), kubeos-node-join and
+ kubeos-node-standalone (membership), kubeos-cert-renew (the 365-day control-plane
+ certificates), kubeos-pod-routes (cross-node pod routing), kubeos-disks-report
+ (LVM facts for the dashboard) and kubeos-dashboard-install.
+ .
+ /etc/kubeos/kubeos.conf is a conffile: POD_CIDR and SERVICE_CIDR default to
+ "auto" and node-setup records the ranges it actually used in
+ /etc/kubeos/cluster-network.conf, which this package never ships or touches.
