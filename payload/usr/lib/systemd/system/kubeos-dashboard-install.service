@@ -13,7 +13,10 @@ Description=KubeOS dashboard install (the release shipped in this image)
 Documentation=https://kubeos.in/
 After=node-setup.service kubelet.service network-online.target
 Wants=node-setup.service
-ConditionPathExists=/etc/kubernetes/admin.conf
+# Either identity will do: the control plane's admin.conf, or (on a worker) the dashboard
+# kubeconfig from the join. The '|' prefix makes conditions OR-ed instead of AND-ed.
+ConditionPathExists=|/etc/kubernetes/admin.conf
+ConditionPathExists=|/etc/kubeos-dashboard/kubeconfig
 ConditionPathExists=/usr/share/kubeos/dashboard/RELEASE
 
 [Service]

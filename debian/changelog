@@ -1,3 +1,28 @@
+kubeos-cli (1.0.0-12) trixie; urgency=medium
+
+  * kubeos-dashboard-install works on a worker, so upgrading kubeos-dashboard applies there too.
+    The installer and its unit insisted on /etc/kubernetes/admin.conf, which only a control plane
+    has, so on kubeos2/kubeos3 a dashboard upgrade moved the package version and left the OLD
+    dashboard running until the node was re-joined - the same "upgraded but still old" class the
+    dashboard package itself was fixed for (2026-11-20). The installer now falls back to this
+    node's dashboard kubeconfig (the service-account identity the join string provides, which can
+    do everything it needs: adopt the CA Secret, keep the console token, write the units), and the
+    unit accepts either identity with OR-ed conditions.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 21:10:00 +0530
+
+kubeos-cli (1.0.0-11) trixie; urgency=medium
+
+  * Start the timers this package ships when it is installed or upgraded. A .wants link only
+    starts a unit at the next boot, so on a running node the pod-route reconciler (15 s),
+    the certificate renewal check and the disk report stayed inactive until a reboot - and for
+    kubeos-pod-routes that means a re-joined node's new podCIDR is never propagated, which is a
+    networking outage dressed up as a CNI bug (measured 2026-11-13). postinst starts them and
+    reconciles the routes once immediately; it never touches node-setup, so it cannot rebuild a
+    cluster.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 20:55:00 +0530
+
 kubeos-cli (1.0.0-10) trixie; urgency=medium
 
   * kubeos-node-join: point root's kubeconfig at the cluster the node joined.

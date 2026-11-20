@@ -1,0 +1,35 @@
+#!/bin/sh
+# KubeOS CLI, postinst: start the timers this package ships.
+#
+# WHY   A .wants link shipped in a package only starts a unit when its target (timers.target or
+#       multi-user.target) is next activated - i.e. at the next BOOT. So on a running node an
+#       install or upgrade leaves these timers inactive: pod-route reconciliation (15 s), the
+#       certificate renewal check and the disk report would all silently wait for a reboot. That
+#       is the same trap that was measured twice on 2026-11-20 (the storage sweep timer and the
+#       etcd backup timer), and it matters most for kubeos-pod-routes: without it a re-joined
+#       node's new podCIDR is never propagated, which is a networking outage that looks like a
+#       CNI bug (measured 2026-11-13).
+# SAFE  Re-runnable and never fatal: `start` on an already-running timer is a no-op, a node
+#       without systemd (the live-build chroot) is skipped, and nothing here can rebuild a
+#       cluster - the services these timers start only reconcile state.
+set -e
+
+# debhelper inserts its generated snippets here; it must sit before this script's own exits.
+#DEBHELPER#
+
+case "${1:-}" in
+    configure) : ;;
+    *) exit 0 ;;
+esac
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    for timer in kubeos-pod-routes.timer kubeos-cert-renew.timer kubeos-disks-report.timer; do
+        systemctl start "$timer" >/dev/null 2>&1 || true
+    done
+    # Reconcile the routes immediately instead of waiting for the first tick, and reset the
+    # oneshot so a failed run from a previous version is not reported as the current state.
+    systemctl reset-failed kubeos-pod-routes.service >/dev/null 2>&1 || true
+    systemctl start kubeos-pod-routes.service >/dev/null 2>&1 || true
+fi
+exit 0

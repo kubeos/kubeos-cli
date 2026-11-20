@@ -27,6 +27,10 @@ STATE_DIR=/var/lib/kubeos
 PAYLOAD_DIR=/usr/share/kubeos/dashboard
 RELEASE_HOME=/root
 ADMIN_CONF=/etc/kubernetes/admin.conf
+# A worker has no admin.conf but DOES have the cluster identity its dashboard already uses;
+# that is enough to redeploy the release, and without it an upgraded kubeos-dashboard on a
+# worker kept running the old code until the node was re-joined (found 2026-11-20).
+DASHBOARD_KUBECONFIG=/etc/kubeos-dashboard/kubeconfig
 DASHBOARD_PORT=30443
 CONSOLE_PORT=30444
 FIRST_UNIT=kubeos-dashboard
@@ -35,9 +39,18 @@ WAIT_SECONDS=60
 
 [ "$(id -u)" -eq 0 ] || { warn "run this as root"; exit 1; }
 
-# A worker has no admin.conf: its dashboard comes from the join string, not from this installer.
-if [ ! -s "$ADMIN_CONF" ]; then
-    log "not a control plane (no $ADMIN_CONF) - a joined worker gets its dashboard from the join"
+# Which identity may this machine use? A control plane has admin.conf; a worker that has already
+# been joined has its dashboard kubeconfig (a service-account identity from the join string, which
+# can do everything this installer needs: adopt the CA Secret, keep the console token, write the
+# units). Neither present means a machine that has no dashboard yet - the join will install it.
+INSTALL_KUBECONFIG=""
+if [ -s "$ADMIN_CONF" ]; then
+    INSTALL_KUBECONFIG=$ADMIN_CONF
+elif [ -s "$DASHBOARD_KUBECONFIG" ]; then
+    INSTALL_KUBECONFIG=$DASHBOARD_KUBECONFIG
+    log "no $ADMIN_CONF (a worker): redeploying with this node's dashboard identity"
+else
+    log "no $ADMIN_CONF and no $DASHBOARD_KUBECONFIG - nothing to install on this machine yet"
     exit 0
 fi
 
@@ -128,7 +141,7 @@ fi
 # never overwrite), issues this node's certificate, creates/keeps the console token, writes the
 # units and installs kubeos-trust-ca. --no-start because we start the three units together below.
 log "running the dashboard installer"
-if ! "$PAYLOAD_DIR/install.sh" --kubeconfig "$ADMIN_CONF" \
+if ! "$PAYLOAD_DIR/install.sh" --kubeconfig "$INSTALL_KUBECONFIG" \
         --port "$DASHBOARD_PORT" --console-port "$CONSOLE_PORT" --no-start; then
     warn "the dashboard installer failed - this node is still a working cluster without a dashboard"
     warn "diagnose with: journalctl -u $FIRST_UNIT -n 50; then re-run kubeos-dashboard-install"
