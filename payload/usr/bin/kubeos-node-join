@@ -187,6 +187,22 @@ adopt_dashboard() {
             die "could not write $DASHBOARD_KUBECONFIG"
         log "this node's dashboard now points at the joined cluster ($DASHBOARD_KUBECONFIG)"
     fi
+    # `kubectl` as root is the first thing an operator types, and on a worker it used to fail:
+    # /root/.kube/config survives the join from the one-node cluster the installation created and
+    # still names https://<this node>:6443 - the apiserver this script has just stopped - so
+    # `kubectl get nodes` answered "connection refused" on every worker while the user guide reads
+    # as if kubectl works on every node (measured 2026-11-20, on a fresh install of the current
+    # ISO). The identity written here is the one the dashboard already holds and root could
+    # already read, so this grants no new power: it only points the default kubeconfig at the
+    # cluster this node actually joined.
+    if [ -f "$DASHBOARD_KUBECONFIG" ]; then
+        install -d -m 0700 /root/.kube
+        if install -m 0600 "$DASHBOARD_KUBECONFIG" /root/.kube/config; then
+            log "kubectl on this node now uses the joined cluster (/root/.kube/config)"
+        else
+            log "WARNING: could not write /root/.kube/config - kubectl will not work here"
+        fi
+    fi
     # THE CONSOLE TOKEN IS PART OF THE HANDOVER, and this is why: the dashboard page reads it from
     # Secret kubeos-system/kubeos-console-token, while the console on THIS machine compares against
     # the file on its own disk. A node that installed its dashboard while it was still its own

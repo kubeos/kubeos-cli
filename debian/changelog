@@ -1,3 +1,15 @@
+kubeos-cli (1.0.0-10) trixie; urgency=medium
+
+  * kubeos-node-join: point root's kubeconfig at the cluster the node joined.
+    /root/.kube/config survives from the one-node cluster the installation created and still
+    names https://<this node>:6443 - the apiserver the join has just stopped - so `kubectl get
+    nodes` on a worker answered "connection refused" while the user guide reads as if kubectl
+    works on every node (measured 2026-11-20 on a fresh install). The file now receives the
+    cluster identity the dashboard already holds, which root could already read, so no new
+    privilege is granted: only the default kubeconfig changes.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 09:55:00 +0530
+
 kubeos-cli (1.0.0-9) trixie; urgency=medium
 
   * kubeos-node-join: keep the unit list on ONE line in the two messages that print it. The
