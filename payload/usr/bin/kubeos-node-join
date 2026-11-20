@@ -31,9 +31,19 @@ STATE=/var/lib/kubeos
 ADMIN_CONF=/etc/kubernetes/admin.conf
 # Every unit the ISO brings up for the one-node control plane, plus the timer that reports
 # this machine's disks into it. A worker keeps containerd, kubelet and kube-proxy only.
-CONTROL_PLANE_UNITS="etcd kube-apiserver kube-controller-manager kube-scheduler
-kubeos-coredns kubeos-metrics-server kubeos-storage-provisioner"
+# THE ORDER IS THE DEPENDENCY ORDER, REVERSED, because section 1 stops them in this order:
+# whatever talks to the API server stops first (metrics-server, CoreDNS, the provisioner, the
+# controllers), then the API server, then etcd. Stopping etcd first - the old order - left
+# kube-apiserver restarting against a dead store until systemd gave up with `start-limit-hit`
+# and `Unit process … (kube-apiserver) remains running after unit stopped`, which looked like a
+# failed stop but was the unit fighting its own Restart=on-failure (measured 2026-11-20).
+CONTROL_PLANE_UNITS="kubeos-metrics-server kubeos-coredns kubeos-storage-provisioner
+kube-controller-manager kube-scheduler kube-apiserver etcd"
 CONTROL_PLANE_EXTRA="kubeos-disks-report.timer"
+# The list above is wrapped over two lines to stay readable, but log messages must show it on
+# one: an unquoted expansion re-joins the words with single spaces (shellcheck is told so).
+# shellcheck disable=SC2086
+CONTROL_PLANE_ONELINE=$(echo $CONTROL_PLANE_UNITS)
 CNI_CONF=/etc/cni/net.d/10-kubeos.conflist
 # Handed over inside the join string (see the decoder above) and adopted at the end.
 JOIN_DASHBOARD_CONF=/run/kubeos-join-dashboard.conf
@@ -211,35 +221,102 @@ log "disabling the control-plane units (a worker runs containerd, kubelet and ku
 # configs `kubeadm reset` had just deleted. Measured 2026-11-12 on the first two-node test.
 # `disable --now` on a missing unit is harmless, so the honest version just does it.
 for unit in $CONTROL_PLANE_UNITS $CONTROL_PLANE_EXTRA; do
+    # "Not installed" is a fact, and only `systemctl cat` establishes it. The first version
+    # printed it whenever `disable --now` exited non-zero - which is also what a unit in
+    # `start-limit-hit` state does, and what a unit needing longer than its stop timeout does,
+    # so the log called units "not installed or not running" that were running the whole time
+    # (measured 2026-11-20: etcd and kube-apiserver, both active, both reported as absent).
+    if ! systemctl cat "$unit" >/dev/null 2>&1; then
+        log "note: $unit is not installed on this machine (nothing to stop)"
+        continue
+    fi
     systemctl disable --now "$unit" >/dev/null 2>&1 ||
-        log "note: $unit was not installed or not running (continuing)"
+        log "note: $unit did not stop cleanly; the wait below decides whether it matters"
 done
 # A unit that failed because its config is gone stays "failed" for ever otherwise, and a
 # Restart=on-failure service that kubeadm reset broke keeps spinning.
 # shellcheck disable=SC2086  # deliberately unquoted: one argument per unit
 systemctl reset-failed $CONTROL_PLANE_UNITS $CONTROL_PLANE_EXTRA >/dev/null 2>&1 || true
 
+# HOW LONG to wait is systemd's own answer, not a number invented here: a unit's
+# TimeoutStopUSec is the manager's own patience with it, and systemd 257 prints it as a human
+# timespan ("1min 30s"). The old fixed 20 s expired first when etcd took 26 s to stop
+# (measured 2026-11-20) and produced a WARNING about a node that was shutting down perfectly.
+stop_secs() {
+    total=0
+    for field in $1; do
+        digits=${field%%[!0-9]*}
+        if [ -z "$digits" ]; then
+            continue
+        fi
+        case ${field#"$digits"} in
+            h) total=$((total + digits * 3600)) ;;
+            min) total=$((total + digits * 60)) ;;
+            s) total=$((total + digits)) ;;
+        esac
+    done
+    printf '%s' "$total"
+}
+stop_wait=20
+for unit in $CONTROL_PLANE_UNITS; do
+    secs=$(stop_secs "$(systemctl show "$unit" -p TimeoutStopUSec --value 2>/dev/null || true)")
+    if [ "$secs" -gt "$stop_wait" ]; then
+        stop_wait=$secs
+    fi
+done
+# A single unit may legitimately be given minutes; a join should not hang that long.
+if [ "$stop_wait" -gt 120 ]; then
+    stop_wait=120
+fi
+
 # Say so if it did not take: silence here is how the first version hid the bug. It only
 # WARNS and waits, because by now this node's own cluster is already stopped - dying here
 # would leave a machine with no cluster and no join (measured 2026-11-12: a unit that needs a
 # moment to shut down made this `die`, and the node was left in limbo with a dead dashboard).
-wait_left=20
-while [ "$wait_left" -gt 0 ]; do
+wait_left=$stop_wait
+still_running=0
+running_units=""
+while :; do
     still_running=0
+    running_units=""
     for unit in $CONTROL_PLANE_UNITS; do
         case $(systemctl is-active "$unit" 2>/dev/null) in
-            active | activating | deactivating) still_running=$((still_running + 1)) ;;
+            active | activating | deactivating)
+                still_running=$((still_running + 1))
+                running_units="$running_units $unit"
+                ;;
         esac
     done
-    [ "$still_running" -eq 0 ] && break
+    if [ "$still_running" -eq 0 ]; then
+        break
+    fi
+    if [ "$wait_left" -le 0 ]; then
+        break
+    fi
     sleep 1
     wait_left=$((wait_left - 1))
 done
-if [ "$still_running" -ne 0 ]; then
-    log "WARNING: $still_running control-plane unit(s) are still running; this node will keep"
-    log "         restarting things it should not. Check: systemctl list-units 'etcd*' 'kube-*'"
-    log "         Continuing anyway: the cluster has already been stopped, so aborting now"
-    log "         would leave this node with neither cluster nor join."
+if [ "$still_running" -eq 0 ]; then
+    log "control plane stopped: none of $CONTROL_PLANE_ONELINE is active"
+else
+    log "WARNING: still running after ${stop_wait}s:${running_units}"
+    log "         A control-plane unit that outlives this join keeps restarting things a worker"
+    log "         must not run. Continuing anyway: this node's own cluster is already stopped, so"
+    log "         aborting now would leave it with neither cluster nor join (measured 2026-11-12)."
+    log "         Check with: systemctl list-units 'etcd*' 'kube-*'"
+fi
+# A unit cancelled in the middle of a restart ends up `failed`, which `is-active` does not
+# count - yet systemd may still hold a process from it (measured 2026-11-20: "Unit process
+# 9460 (kube-apiserver) remains running after unit stopped"). Step 2's `kubeadm reset --force`
+# clears those; naming them here is what keeps that from looking mysterious.
+failed_units=""
+for unit in $CONTROL_PLANE_UNITS; do
+    if [ "$(systemctl is-failed "$unit" 2>/dev/null)" = failed ]; then
+        failed_units="$failed_units $unit"
+    fi
+done
+if [ -n "$failed_units" ]; then
+    log "note: stopped in failed state (a restart was cancelled):${failed_units}"
 fi
 
 # ---- 2. discard the one-node cluster --------------------------------------
@@ -272,8 +349,7 @@ done
 if [ "$still_running" -ne 0 ]; then
     # shellcheck disable=SC2086  # deliberately unquoted: one argument per unit
     log "WARNING: $still_running control-plane unit(s) came back after the reset - stop them by hand:"
-    # shellcheck disable=SC2086
-    log "         systemctl stop $CONTROL_PLANE_UNITS"
+    log "         systemctl stop $CONTROL_PLANE_ONELINE"
 fi
 # The first-boot marker stays: node-setup must NOT run again on reboot and rebuild a
 # control plane on this machine.

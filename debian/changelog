@@ -1,3 +1,32 @@
+kubeos-cli (1.0.0-9) trixie; urgency=medium
+
+  * kubeos-node-join: keep the unit list on ONE line in the two messages that print it. The
+    variable is wrapped over two lines to stay readable, so the journal showed the shutdown
+    report - and therefore the recommended `systemctl stop` - as two lines, with the second
+    half (the tail of the list plus "is active") looking like an unrelated remark.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 08:00:00 +0530
+
+kubeos-cli (1.0.0-8) trixie; urgency=medium
+
+  * kubeos-node-join: make the control-plane shutdown honest, and order it correctly.
+    The units are now stopped in reverse dependency order - metrics-server, CoreDNS, the
+    provisioner, the controllers, then the API server, then etcd - because stopping etcd
+    first left kube-apiserver restarting against a dead store until systemd gave up with
+    `start-limit-hit` and `Unit process … (kube-apiserver) remains running after unit
+    stopped` (measured 2026-11-20 on a re-joined node).
+  * kubeos-node-join: report "not installed" only when that is true. The old note was the
+    `||` branch of `systemctl disable --now`, which also exits non-zero for a unit in
+    `start-limit-hit` state or one that needs longer than its stop timeout, so two units
+    that were running the whole time were logged as "was not installed or not running".
+  * kubeos-node-join: wait as long as systemd itself will. The fixed 20 s expired while
+    etcd was still stopping (26 s measured), so the join warned that the node "will keep
+    restarting things it should not" - about a node that was shutting down perfectly and
+    then joined cleanly. The budget now comes from each unit's TimeoutStopUSec, is capped
+    at 120 s, and the warning names the units that are late instead of counting them.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 07:52:00 +0530
+
 kubeos-cli (1.0.0-7) trixie; urgency=medium
 
   * kubeos-node-join: take the kube-proxy identity from the cluster the node JUST JOINED,
@@ -41,6 +70,8 @@ kubeos-cli (1.0.0-1kubeos4) trixie; urgency=medium
     old one (measured 2026-11-19).
   * It also prunes plugin directories the new release no longer carries, because the unpack
     merges into the existing payload directory instead of replacing it.
+
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 20:10:00 +0530
 
 kubeos-cli (1.0.0-1kubeos3) trixie; urgency=medium
 
