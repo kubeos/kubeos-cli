@@ -26,16 +26,15 @@ set -eu
 # the per-machine secrets and configuration exist before the machine is first booted
 # and first boot only has to start services (~8 s instead of ~15 s). Everything here
 # is idempotent, so a half-finished prepare is repaired by the first boot.
-# The banner shown at the console while provisioning is still unfinished. It is
-# replaced by /etc/issue.final once node-ready succeeds.
-# It deliberately carries NO duration ("about 15 seconds"): first boot is ~15 s on
-# fast storage and much longer on a slow disk or a slow VM, so a printed number
-# becomes a lie the user can time. It shows the dashboard address instead, which is
-# what the user actually wants to know.
-# Keep the port in sync with the dashboard chart (~/kubeos-dashboard/deploy/
-# values.yaml, service.nodePort) - the URL is https because Headlamp terminates TLS
-# itself with a per-machine certificate.
-DASHBOARD_PORT=30443
+# /etc/issue is NOT touched here any more (user decision 2026-11-22). It used to be
+# overwritten with a temporary "Web dashboard: https://<ip>:30443" banner while the
+# first boot ran, and node-ready replaced it with /etc/issue.final afterwards - but a
+# getty prints /etc/issue only once, when it draws the prompt, so on the very first
+# boot the console showed that temporary text even though the file was already
+# correct (cat /etc/issue agreed with the user, the screen did not; the art appeared
+# from the second boot on). The KubeOS banner now names the host and the dashboard
+# itself with the agetty escapes \n and \4 (the node's own name and IPv4, expanded
+# when the prompt is drawn), so nothing has to write this file at first boot.
 
 PREPARE_ONLY=0
 if [ "${1:-}" = "--prepare-only" ]; then
@@ -80,23 +79,6 @@ if [ -r "$CONF" ]; then
 fi
 
 log() { echo "node-setup: $*"; }
-
-# say_first_boot_running: put the dashboard address in /etc/issue (idempotent).
-# Called once NODE_IP is known; node-ready replaces the file with issue.final later.
-# Deliberately no "setting up …" or "do not power off" narration: the console
-# shows the banner and the address, nothing else (user, 2026-11-11).
-say_first_boot_running() {
-    [ -f /etc/issue ] || return 0
-    if grep -q "Web dashboard" /etc/issue 2>/dev/null; then
-        return 0
-    fi
-    # No hostname in the header: in --prepare-only mode the kernel still reports the
-    # live session's name, and node-ready replaces this file once the
-    # node is up anyway.
-    printf '%s\n\n%s\n\n' "KubeOS Linux 0.1.0 alpha (Orhan)" \
-"Web dashboard:  https://${NODE_IP}:${DASHBOARD_PORT}
-(self-signed certificate: accept the browser warning once)" > /etc/issue
-}
 
 # --- IPv4 arithmetic (no ipcalc, no python3 on a slim image) ----------------
 ip_to_int() {
@@ -286,11 +268,6 @@ fi
 NODE_IP="$(node_ip || true)"
 [ -n "$NODE_IP" ] || die "could not determine this node's IP (no default route?); a KubeOS node needs a network connection"
 log "node address $NODE_IP"
-
-# Tell the console what is happening before the slow part starts. Moved below the
-# address discovery because the notice prints the dashboard URL; on a re-run the
-# /etc/issue guard makes it a no-op.
-say_first_boot_running
 
 if [ -f "$ADMIN_CONF" ] && [ -f "$STATE" ]; then
     # shellcheck disable=SC1090  # written by this script in an earlier run

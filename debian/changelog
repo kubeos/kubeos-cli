@@ -1,3 +1,23 @@
+kubeos-cli (1.0.0-13) trixie; urgency=medium
+
+  * node-setup no longer writes a temporary "Web dashboard: https://<ip>:30443" banner into
+    /etc/issue during the first boot (user decision 2026-11-22). A getty prints /etc/issue once,
+    when it draws the login prompt, so on the very first boot the console showed that temporary
+    text even though the file on disk was already the KubeOS banner - "cat /etc/issue" showed the
+    art while the screen above it showed the old two lines, and the art only appeared from the
+    second boot. Measured on a fresh 2026-11-22 install.
+    The temporary banner existed only to publish the dashboard address before the final banner
+    did; since kubeos-branding 0.1.0-9 the banner names the host and the dashboard itself with
+    the agetty escapes \n and \4, which agetty expands per machine when the prompt is drawn, so
+    /etc/issue now needs no write at first boot at all. node-ready still installs
+    /etc/issue.final as /etc/issue - idempotent, and the sed it keeps is a no-op with the current
+    banner while still handling an older issue.final that carries the placeholder.
+    Consequence to know: the console no longer prints "(self-signed certificate: accept the
+    browser warning once)" during the first boot; that advice is in docs/USER-GUIDE.md and in the
+    browser's own certificate warning.
+
+ -- KubeOS <mail@kubeos.in>  Sun, 22 Nov 2026 02:30:00 +0530
+
 kubeos-cli (1.0.0-12) trixie; urgency=medium
 
   * kubeos-dashboard-install works on a worker, so upgrading kubeos-dashboard applies there too.

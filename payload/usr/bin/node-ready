@@ -18,8 +18,8 @@ set -eu
 export KUBECONFIG=/etc/kubernetes/admin.conf
 MARKER=/var/lib/kubeos/initialized
 WAIT_TOTAL=300   # seconds a single wait may take before we give up
-# Port the dashboard is published on. Keep in sync with node-setup (DASHBOARD_PORT)
-# and with the dashboard chart (~/kubeos-dashboard/deploy/values.yaml, nodePort).
+# Port the dashboard is published on, used only for the log line below. Keep in sync
+# with the dashboard chart (~/kubeos-dashboard/deploy/values.yaml, nodePort).
 DASHBOARD_PORT=30443
 # Every unit part 1 starts, in the order a human would check them.
 UNITS="etcd kube-apiserver kube-controller-manager kube-scheduler kube-proxy kubeos-coredns kubeos-metrics-server kubeos-storage-provisioner"
@@ -131,15 +131,14 @@ else
     log "WARNING: could not enable kubeos-disks-report.timer; the dashboard's Disks page will be empty"
 fi
 
-# 8. The login banner: while setup runs, /etc/issue says so; afterwards it explains
-#    the node and where the dashboard is. A user who reboots into a first boot
-#    should be told why the prompt takes a while instead of being left guessing (the
-#    banner names no duration on purpose - a printed estimate is a promise the
-#    machine breaks on slow storage), and the final banner documents the host-service
-#    design without needing a manual step. The address is substituted here because
-#    /etc/issue.final is static in the image and the node address is per machine.
-#    Keep DASHBOARD_PORT in sync with node-setup and with the dashboard chart
-#    (~/kubeos-dashboard/deploy/values.yaml, service.nodePort).
+# 8. The login banner: install /etc/issue.final as /etc/issue, so the next getty
+#    prints the KubeOS banner. Since 2026-11-22 that banner carries its own per-machine
+#    values - the agetty escapes \n (node name) and \4 (the node's IPv4) - so nothing
+#    has to be substituted and node-setup no longer writes a temporary banner at all
+#    (a getty reads /etc/issue once, when it draws the prompt, so a temporary file
+#    showed on the very first boot even though this file was already the right one).
+#    The sed is kept, and is a no-op, for an issue.final from an older branding package
+#    that still carried the __KUBEOS_NODE_IP__ placeholder.
 if [ -f /etc/issue.final ]; then
     banner_ip="$(sed -n 's/^NODE_IP=//p' /etc/kubeos/cluster-network.conf 2>/dev/null | head -n 1)"
     sed "s|__KUBEOS_NODE_IP__|${banner_ip:-this-node}|g" /etc/issue.final > /etc/issue
